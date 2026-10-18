@@ -29,6 +29,9 @@ dynamic = ["version"]
 [project.scripts]
 cli-gateway = "cli_gateway.__main__:main"
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.urls]
 Homepage = "https://github.com/ningL32/cli-gateway"
 Changelog = "https://github.com/ningL32/cli-gateway/blob/main/CHANGELOG.md"
