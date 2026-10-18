@@ -2,7 +2,7 @@
 
 统一 CLI 进程调用网关：让"AI 调 CLI 是否真跑、输出能否逐字核对"变得可观测、可审计、可回放。
 
-**v1 定位**：本地 subprocess 薄包装（~150 行）。不涉及任何 URL/网络请求。
+**v1 定位**：本地 subprocess 薄包装。不涉及任何 URL/网络请求。
 
 ## 为什么
 
@@ -24,7 +24,8 @@ print(res.exit_code, res.duration_ms, res.log_path)
 print(replay(res.log_path))   # 逐字回放
 
 # 作为 CLI
-cli-gateway run -- echo hello
+# 注意：--timeout/--dir 必须写在 -- 之前；-- 之后的参数全部属于被调命令
+cli-gateway run --timeout 10 -- echo hello
 cli-gateway replay ~/.cli-gateway/logs/20261018-190000-echo-abc12345.log
 cli-gateway logs
 ```
@@ -34,15 +35,39 @@ cli-gateway logs
 | 字段 | 说明 |
 |---|---|
 | `command` | 原始命令 |
-| `exit_code` | 退出码（超时=-1，找不到命令=-1） |
+| `exit_code` | 退出码：命令未找到=**127**，启动失败（不可执行等）=**126**，超时=**124**，其余为命令真实退出码（POSIX 被信号杀死时为负信号值） |
 | `duration_ms` | 耗时毫秒 |
 | `log_path` | 全量日志文件路径 |
-| `stdout_tail` / `stderr_tail` | 输出尾部（默认各 2000 字符） |
-| `timestamp` / `pid` / `success` | 时间戳 / 进程号 / 是否成功 |
+| `stdout_tail` / `stderr_tail` | 输出尾部（默认各 2000 字符，从日志文件取尾，内存有界） |
+| `timestamp` / `pid` / `success` | 时间戳 / 真实进程号 / 是否成功 |
+| `state` | 枚举：`completed` / `timed_out` / `not_found` / `spawn_error` / `killed`（spawn_error 是对 shell 惯例枚举的扩展） |
+| `cwd` | 本次调用的 working directory（未传为 None） |
+| `truncated` | 输出超过 tail 长度被截断时为 True |
+| `timed_out` | 超时标志（等价 `state == "timed_out"`） |
+| `env_overrides` | 显式传入的 env 覆盖项（含 KEY/TOKEN/SECRET/PASSWORD 的值脱敏为 `***`，不记录全量环境） |
 
 ## 日志格式
 
-每次调用写一个文件 `<ts>-<cmd>-<id>.log`，内容为元数据头 + STDOUT 段 + STDERR 段，可逐字回放、可审计。
+每次调用写一个文件 `<ts>-<cmd>-<id>.log`：元数据头（command/timestamp/pid/cwd/env_overrides/timeout）+ STDOUT 段 + STDERR 段 + END + 结果尾（exit_code/duration_ms/state），可逐字回放、可审计。超时路径保留已产生的部分输出（partial）。
+
+## 注册表（run_cli，白名单路径）
+
+```python
+from cli_gateway import REGISTRY, CliSpec, run_cli
+
+REGISTRY["claude"] = CliSpec(default_timeout=600, tail=2000)  # 零依赖顶层 dict
+res = run_cli("claude", "--version")        # 未注册名字 → KeyError；run() 不查注册表
+```
+
+`CliSpec` 字段：`default_timeout` / `capture` / `tail` / `cwd` / `env` / `retry_on`。重试只在显式传 `retry_count` 时发生，且只重试"启动前失败"（`not_found` / `spawn_error`；超时与非零退出绝不自动重试），每次尝试独立日志文件。`retry_on` 字段当前仅支持 `"spawn"`，其他值保留但不生效。
+
+## 超时与进程组
+
+超时（`timeout` 秒，默认无限等）会按进程组/进程树终止：POSIX 用 `start_new_session` + `os.killpg`（先 SIGTERM，宽限 2s 后 SIGKILL）；Windows 用 `CREATE_NEW_PROCESS_GROUP` + `taskkill /F /T`。这会大幅降低孤儿孙进程残留的概率，但不是绝对保证——极端场景（第三方进程自行脱离进程组/进程树、或孙进程继承管道写句柄导致输出流不关闭）可能有残留或输出不完整，此时结果会置 `truncated=True` 并在日志尾部追加 `# warning:` 行，由调用方按需兜底。
+
+POSIX 下进程被信号杀死时 `state="killed"`、`exit_code` 为负信号值；Windows 正常退出（含非零退出码）均为 `completed`。
+
+输出读取统一按 UTF-8（`errors="replace"`），日志始终是合法 UTF-8。gateway 默认向子进程注入 `PYTHONUTF8=1`（调用方或父环境已显式设置该变量时不覆盖），使 python 类子进程在 Windows 传统代码页（CP936 等）环境下也输出 UTF-8——注意子进程会看到这个变量。
 
 ## 设计边界（v1）
 
