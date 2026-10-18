@@ -28,6 +28,7 @@ print(replay(res.log_path))   # 逐字回放
 cli-gateway run --timeout 10 -- echo hello
 cli-gateway replay ~/.cli-gateway/logs/20261018-190000-echo-abc12345.log
 cli-gateway logs
+cli-gateway doctor
 ```
 
 ## 返回结构（GatewayResult）
@@ -85,6 +86,17 @@ Git Bash 传参注意：MSYS 会把独立参数 `/c` 转换成 `C:\`，命令行
 | qoder | 1.1.72 | 直调 exe（命令名 `qoderclicn`） | `qoderclicn -p "<prompt>"` | ✅ |
 | crush | v0.88.0 | 直调 exe（自动命中 WinGet 版） | `crush run "<prompt>"` | ✅ |
 | hermes | v0.21.3 | 直调 exe | `hermes -z "<prompt>"` | ✅ |
+
+矩阵可在你自己的机器上实时复现：
+
+```bash
+cli-gateway doctor                # 体检内置 9 个编码 CLI：形态/版本/日志路径
+cli-gateway doctor --json         # 结构化输出（agent 消费友好）
+cli-gateway doctor --no-probe     # 静态快查：只看安装形态，不实跑版本探测
+cli-gateway doctor --only codex   # 只查指定命令
+```
+
+形态判定以网关真实调用结果为准（先直调，Windows 下 not_found 自动再试 `cmd /c` 包装），不是静态猜测；全部可用退出码 0，否则 1——可直接接进 CI 或 agent 的启动自检。
 
 ## 子智能体编队（agents/）
 

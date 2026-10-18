@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import platform
 import sys
 
-from . import list_logs, replay, run
+from . import DEFAULT_LOG_DIR, list_logs, replay, run
+from .doctor import doctor
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,6 +32,12 @@ def main(argv: list[str] | None = None) -> int:
 
     p_logs = sub.add_parser("logs", help="列出全部调用日志")
     p_logs.add_argument("--dir", default=None, help="日志目录")
+
+    p_doctor = sub.add_parser("doctor", help="体检本机编码 CLI：安装形态/版本/调用配方")
+    p_doctor.add_argument("--only", nargs="+", metavar="CMD", help="只查指定命令（默认内置 9 个编码 CLI）")
+    p_doctor.add_argument("--json", action="store_true", help="结构化 JSON 输出")
+    p_doctor.add_argument("--no-probe", action="store_true", help="静态快查：只看 PATH 形态，不实跑版本探测")
+    p_doctor.add_argument("--timeout", type=float, default=20.0, help="单命令探测超时秒数")
 
     args = parser.parse_args(argv)
 
@@ -63,6 +72,23 @@ def main(argv: list[str] | None = None) -> int:
         for p in list_logs(args.dir):
             print(p)
         return 0
+
+    if args.cmd == "doctor":
+        rows = doctor(commands=args.only, probe=not args.no_probe, timeout=args.timeout)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            print(f"cli-gateway doctor  {platform.platform()}  python {sys.version.split()[0]}")
+            for r in rows:
+                mark = "✅" if r["ok"] else "❌"
+                ver = r["version"] or "-"
+                dur = f"  {r['duration_ms']}ms" if r["duration_ms"] is not None else ""
+                print(f"  {mark} {r['name']:<10} {r['form']}  |  {ver}{dur}")
+                if r["form"] == "npm shim（需 cmd /c 包装）":
+                    print(f"      └─ 网关调用配方：cmd /c {r['cmd']} ...（Git Bash 写 //c）")
+            ok_n = sum(1 for r in rows if r["ok"])
+            print(f"\n{ok_n}/{len(rows)} 可用；探测日志已落盘 {DEFAULT_LOG_DIR}")
+        return 0 if all(r["ok"] for r in rows) else 1
 
     return 0
 

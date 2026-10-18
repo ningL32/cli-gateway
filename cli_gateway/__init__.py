@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
+__version__ = "1.1.0"
+
 DEFAULT_LOG_DIR = Path(os.environ.get("CLI_GATEWAY_LOG_DIR", "~/.cli-gateway/logs")).expanduser()
 
 _PUMP_CHUNK = 65536       # 流式泵每次从管道读取的字节数（内存有界）
