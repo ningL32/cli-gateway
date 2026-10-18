@@ -61,6 +61,31 @@ res = run_cli("claude", "--version")        # 未注册名字 → KeyError；run
 
 `CliSpec` 字段：`default_timeout` / `capture` / `tail` / `cwd` / `env` / `retry_on`。重试只在显式传 `retry_count` 时发生，且只重试"启动前失败"（`not_found` / `spawn_error`；超时与非零退出绝不自动重试），每次尝试独立日志文件。`retry_on` 字段当前仅支持 `"spawn"`，其他值保留但不生效。
 
+## Windows 须知：npm shim 与直调
+
+Windows 上 `Popen` 直控走 `CreateProcess`，只解析 `.exe`——npm 全局安装的 CLI（claude / kilo / mcode / opencode 等）目录里只有 `xxx.cmd` shim，直接传名字会得到 `127/not_found`。两种调用方式：
+
+- **原生 exe 直调**：codex / goose / qoderclicn / hermes；crush 的 npm shim 没有 `.exe` 同名文件，`CreateProcess` 会继续搜 PATH 命中 WinGet 的 `crush.exe`，同样直调可用；
+- **npm shim 用 `cmd /c <name> ...` 包装**：gateway 的 `taskkill /T` 树杀仍覆盖 cmd 与其下的整棵进程树。
+
+Git Bash 传参注意：MSYS 会把独立参数 `/c` 转换成 `C:\`，命令行路径须写 `cmd //c` 或设 `MSYS_NO_PATHCONV=1`；走 Python 库传 argv 列表不受影响。
+
+## 真机验证矩阵（2026-10-18，Windows Server 2022）
+
+9 个 CLI 全部经网关真实验证：`--version` 探测 + 真实模型调用（提示词"只回复两个字：收到"）各一次。
+
+| CLI | 版本 | 直调方式 | 非交互用法 | 真实调用 |
+|---|---|---|---|---|
+| claude | 2.1.177 | `cmd /c claude` | `claude -p "<prompt>"` | ✅ |
+| codex | 0.162.1 | 直调 exe | `codex exec "<prompt>"` | ✅ |
+| kilo | 7.7.5 | `cmd /c kilo` | `kilo run "<prompt>"` | ✅ |
+| mcode | 0.4.12 | `cmd /c mcode` | `mcode exec "<prompt>"` | ✅ |
+| goose | 1.51.0 | 直调 exe | `goose run -t "<prompt>"` | ✅ |
+| opencode | 1.18.31 | `cmd /c opencode` | `opencode run "<prompt>"` | ✅ |
+| qoder | 1.1.72 | 直调 exe（命令名 `qoderclicn`） | `qoderclicn -p "<prompt>"` | ✅ |
+| crush | v0.88.0 | 直调 exe（自动命中 WinGet 版） | `crush run "<prompt>"` | ✅ |
+| hermes | v0.21.3 | 直调 exe | `hermes -z "<prompt>"` | ⚠️ 链路 ✅，上游 Zai 额度耗尽 exit=2 如实透传 |
+
 ## 超时与进程组
 
 超时（`timeout` 秒，默认无限等）会按进程组/进程树终止：POSIX 用 `start_new_session` + `os.killpg`（先 SIGTERM，宽限 2s 后 SIGKILL）；Windows 用 `CREATE_NEW_PROCESS_GROUP` + `taskkill /F /T`。这会大幅降低孤儿孙进程残留的概率，但不是绝对保证——极端场景（第三方进程自行脱离进程组/进程树、或孙进程继承管道写句柄导致输出流不关闭）可能有残留或输出不完整，此时结果会置 `truncated=True` 并在日志尾部追加 `# warning:` 行，由调用方按需兜底。
