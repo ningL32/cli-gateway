@@ -84,7 +84,7 @@ Git Bash 传参注意：MSYS 会把独立参数 `/c` 转换成 `C:\`，命令行
 | opencode | 1.18.31 | `cmd /c opencode` | `opencode run "<prompt>"` | ✅ |
 | qoder | 1.1.72 | 直调 exe（命令名 `qoderclicn`） | `qoderclicn -p "<prompt>"` | ✅ |
 | crush | v0.88.0 | 直调 exe（自动命中 WinGet 版） | `crush run "<prompt>"` | ✅ |
-| hermes | v0.21.3 | 直调 exe | `hermes -z "<prompt>"` | ⚠️ 链路 ✅，上游 Zai 额度耗尽 exit=2 如实透传 |
+| hermes | v0.21.3 | 直调 exe | `hermes -z "<prompt>"` | ✅ |
 
 ## 超时与进程组
 
