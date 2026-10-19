@@ -54,6 +54,79 @@ def test_parse_stream_jsonl_and_fallback() -> None:
     assert notes[0]["payload"]["raw"]["type"] == "tool_use"
 
 
+# --- 类型化谱线（fixture 为 2026-10-19 真机采样，脱敏） ----------------------
+
+
+def test_typed_claude_lines() -> None:
+    text = "\n".join(
+        [
+            '{"type":"system","subtype":"init","session_id":"s1"}',
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"收到"}]},"session_id":"s1"}',
+            '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"f":"a.py"}}]}}',
+            '{"type":"user","message":{"content":[{"type":"tool_result","content":"file body"}]}}',
+            '{"type":"result","subtype":"success","result":"收到","is_error":false,"usage":{"output_tokens":20}}',
+            "plain text line ignored",
+        ]
+    )
+    evs = parse_stream(text, "claude")
+    kinds = [e["kind"] for e in evs]
+    assert kinds == ["system", "text", "tool_call", "tool_result", "result"]
+    assert evs[1]["payload"]["text"] == "收到"
+    assert evs[2]["payload"]["name"] == "Read" and evs[2]["payload"]["input"] == {"f": "a.py"}
+    assert evs[4]["payload"]["result"] == "收到"
+    # 守恒律：raw 永远在
+    assert all("raw" in e["payload"] for e in evs)
+
+
+def test_typed_codex_lines() -> None:
+    text = "\n".join(
+        [
+            '{"type":"thread.started","thread_id":"01a"}',
+            '{"type":"turn.started"}',
+            '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"收到"}}',
+            '{"type":"turn.completed","usage":{"input_tokens":17244,"output_tokens":3}}',
+        ]
+    )
+    evs = parse_stream(text, "codex")
+    kinds = [e["kind"] for e in evs]
+    assert kinds == ["system", "system", "text", "result"]
+    assert evs[0]["payload"]["subtype"] == "thread_started"
+    assert evs[2]["payload"]["text"] == "收到"
+    assert evs[3]["payload"]["usage"]["output_tokens"] == 3
+
+
+def test_typed_unknown_item_falls_back_to_note() -> None:
+    # 未收录的 codex item 形态 → note 兜底（守恒律），不丢字
+    evs = parse_stream('{"type":"item.completed","item":{"id":"x","type":"future_thing","data":1}}', "codex")
+    assert evs[0]["kind"] == "note"
+    assert evs[0]["payload"]["raw"]["item"]["type"] == "future_thing"
+
+
+def test_observe_produces_typed_events_for_real_element(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 集成：给 python 临时注册 jsonl 配方（monkeypatch，测试后自动恢复），
+    # 观测模式 → question/system/text/result/answer/exit 类型化事件
+    from cli_gateway import events as ev
+
+    monkeypatch.setitem(ev.ELEMENTS, "python", {"format": "jsonl", "parser": "claude", "flags": []})
+    d = _tmp_logdir(tmp_path)
+    fake_claude = [
+        '{"type":"system","subtype":"init"}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"typed-ok"}]}}',
+        '{"type":"result","subtype":"success","result":"typed-ok"}',
+    ]
+    fixture = tmp_path / "fixture.jsonl"
+    fixture.write_text("\n".join(fake_claude), encoding="utf-8")
+    res = run(
+        [sys.executable, "-c", "import sys; print(open(sys.argv[1]).read(), end='')", str(fixture)],
+        log_dir=d, observe=True, task_id="T-typed",
+    )
+    assert res.state == "completed"
+    events = read_events(res.log_path + ".events.jsonl")
+    kinds = [e["kind"] for e in events]
+    assert "text" in kinds and "result" in kinds and "system" in kinds
+    assert kinds[0] == "question" and kinds[-1] == "exit"
+
+
 def test_observe_writes_sidecar_with_atom_events(tmp_path: Path) -> None:
     d = _tmp_logdir(tmp_path)
     res = run(

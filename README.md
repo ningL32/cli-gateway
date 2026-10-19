@@ -122,7 +122,7 @@ atoms = task_atoms("fix-login")                    # 化合物检索
 task_formula(atoms)                                # 'claude×1 + codex×1'
 ```
 
-**谱线现状**：claude（`--output-format stream-json --verbose`）与 codex（`exec --json`）为 jsonl 离散谱——真机实测一次 claude 调用产生 37 事件（34 条 note 谱线：system/assistant/result + 全文 answer）；其余元素为 text 连续谱，照常执行并记录全文 answer。各 CLI 内部事件 schema 的深度解读（把 note 升级为类型化事件）留待后续版本——当前按行透传，原始字节始终以 raw 日志为准。
+**谱线现状**：claude（`--output-format stream-json --verbose`）与 codex（`exec --json`）为 jsonl 离散谱，且已**类型化**——事件 kind 为 `system` / `text` / `tool_call` / `tool_result` / `reasoning` / `result` / `error`（assistant 消息里的 tool_use 块 → tool_call 事件，对话树可重建）。claude 的 schema 来自真机实测；codex 工具类 item 的字段名为推测实现（宽容兜底，待真任务样本回填）。未收录形态退化为 `note` 兜底，**payload.raw 永远保留**；原始字节始终以 raw 日志为准。
 
 **边界**：answer 事件含输出全文，适合中小输出（超大输出的流式事件化留待后续）；spawn 失败的调用不写 sidecar（raw 日志仍有完整记录）。
 

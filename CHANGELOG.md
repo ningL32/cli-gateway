@@ -2,6 +2,21 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本遵循语义化版本。
 
+## [1.3.0] - 2026-10-19
+
+### Added — 类型化谱线（对话树重建的第一步）
+
+- 谱线事件从 note 透传升级为**语义类型**：`system` / `text` / `tool_call` / `tool_result` / `reasoning` / `result` / `error`（note 保留为未知形态兜底）
+- 周期表条目新增 `parser` 字段：注册配方 = 注册解读器，配方与解读统一在 `ELEMENTS` 一张表
+- claude 解析器（schema 真机实测）：system( subtype)/assistant.content 块（text→text、tool_use→tool_call、tool_result→tool_result）/result
+- codex 解析器（thread/turn/item 模型，实测样本归纳）：thread.started、turn.started/completed、item.completed（agent_message→text、error→error；command_execution/file_change/mcp_tool_call/web_search→tool_call 的字段名为【推测，待真任务样本回填】，取值全走 .get 宽容兜底）
+- 守恒律不变：payload.raw 永远保留，未收录形态退化为 note 不丢字
+- 真机复验：claude 观测调用事件分布 `{question:1, system:14, text:1, result:1, answer:1, exit:1}`——tool_use 块出现时即得 tool_call 事件，对话树可重建
+
+### Changed
+
+- 契约测试 54→58（claude/codex 类型化 fixture、兜底、集成）
+
 ## [1.2.0] - 2026-10-19
 
 ### Added — 观测模式：原子 / 元素 / 化合物

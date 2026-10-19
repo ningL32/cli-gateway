@@ -24,8 +24,8 @@ SCHEMA_VERSION = 1
 # 元素周期表：已知能以结构化谱线发光的元素及其观测配方（flags 追加在 argv 末尾）。
 # 其余元素默认 text（连续谱）：照常执行，仅记录全文 answer 事件。
 ELEMENTS: dict[str, dict[str, Any]] = {
-    "claude": {"format": "jsonl", "flags": ["--output-format", "stream-json", "--verbose"]},
-    "codex": {"format": "jsonl", "flags": ["--json"]},
+    "claude": {"format": "jsonl", "parser": "claude", "flags": ["--output-format", "stream-json", "--verbose"]},
+    "codex": {"format": "jsonl", "parser": "codex", "flags": ["--json"]},
 }
 
 
@@ -47,13 +47,82 @@ def observation_flags(element: str) -> list[str]:
     return list(ELEMENTS.get(element, {}).get("flags", []))
 
 
-def parse_stream(text: str) -> list[dict[str, Any]]:
-    """从输出文本提取结构化 note 事件：逐行尝试 JSON，失败行忽略。
+def _typed_claude(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    """claude stream-json 谱线 → 类型化事件（schema 来自真机实测样本）。"""
+    t = obj.get("type")
+    if t == "system":
+        return [{"type": "system", "subtype": obj.get("subtype"), "raw": obj}]
+    if t == "assistant":
+        out: list[dict[str, Any]] = []
+        for block in (obj.get("message") or {}).get("content") or []:
+            bt = block.get("type") if isinstance(block, dict) else None
+            if bt == "text":
+                out.append({"type": "text", "text": block.get("text", ""), "raw": obj})
+            elif bt == "tool_use":
+                out.append({"type": "tool_call", "name": block.get("name"), "input": block.get("input"), "raw": obj})
+            elif bt == "tool_result":
+                out.append({"type": "tool_result", "content": block.get("content"), "raw": obj})
+        return out
+    if t == "user":
+        out = []
+        for block in (obj.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                out.append({"type": "tool_result", "content": block.get("content"), "raw": obj})
+        return out
+    if t == "result":
+        return [{"type": "result", "subtype": obj.get("subtype"), "result": obj.get("result"),
+                 "is_error": obj.get("is_error"), "usage": obj.get("usage"), "raw": obj}]
+    return []
 
-    保守策略（事实/推测分离）：各 CLI 内部事件 schema 未逐一实测，v1 不做
-    深度解读——能解析的行原样透传为 note.payload，解析不了的由调用方兜底为
-    全文 answer 事件。原始字节始终以 raw 日志为准。
+
+# codex item.type → 归一化事件。agent_message/error 为真机实测；其余 item 形态
+# （command_execution/file_change/reasoning/mcp_tool_call/web_search）的字段名为
+# 【推测，待真任务样本回填】——取值全走 .get 宽容兜底，不匹配也只是退化为 note。
+_CODEX_ITEM_MAP = {
+    "agent_message": lambda it: {"type": "text", "text": it.get("text")},
+    "error": lambda it: {"type": "error", "message": it.get("message")},
+    "reasoning": lambda it: {"type": "reasoning", "text": it.get("text")},
+    "command_execution": lambda it: {"type": "tool_call", "name": "shell", "input": it.get("command")},
+    "file_change": lambda it: {"type": "tool_call", "name": "file_change", "input": it.get("changes")},
+    "mcp_tool_call": lambda it: {"type": "tool_call", "name": it.get("tool"), "input": it.get("arguments")},
+    "web_search": lambda it: {"type": "tool_call", "name": "web_search", "input": it.get("query")},
+}
+
+
+def _typed_codex(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    """codex exec --json 谱线 → 类型化事件（thread/turn/item 模型，实测样本归纳）。"""
+    t = obj.get("type")
+    if t == "thread.started":
+        return [{"type": "system", "subtype": "thread_started", "thread_id": obj.get("thread_id"), "raw": obj}]
+    if t == "turn.started":
+        return [{"type": "system", "subtype": "turn_started", "raw": obj}]
+    if t == "turn.completed":
+        return [{"type": "result", "usage": obj.get("usage"), "raw": obj}]
+    if t in ("item.started", "item.updated", "item.completed"):
+        item = obj.get("item") or {}
+        mapper = _CODEX_ITEM_MAP.get(item.get("type"))
+        if mapper is None:
+            return []
+        ev = mapper(item)
+        ev["raw"] = obj
+        ev["item_phase"] = t
+        return [ev]
+    return []
+
+
+_TYPED_DISPATCH = {"claude": _typed_claude, "codex": _typed_codex}
+
+
+def parse_stream(text: str, element: str = "") -> list[dict[str, Any]]:
+    """从输出文本提取结构化谱线事件：逐行 JSON，按元素分发类型化解析。
+
+    守恒律三层兜底：元素有类型化解析器且行匹配 → 语义事件（tool_call/text/
+    reasoning/system/result/error）；行是合法 JSON 但不匹配已知 schema → note
+    透传；非 JSON 行 → 忽略（全文由 answer 事件兜底）。payload.raw 永远保留。
     """
+    # 配方与解读统一在周期表：parser 字段指向分派器，注册配方 = 注册解读
+    parser_name = ELEMENTS.get(element, {}).get("parser")
+    dispatch = _TYPED_DISPATCH.get(parser_name) if parser_name else None
     notes: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
@@ -63,7 +132,15 @@ def parse_stream(text: str) -> list[dict[str, Any]]:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(obj, (dict, list, int, float, bool)) or obj is None:
+        if not isinstance(obj, dict):
+            if isinstance(obj, (list, int, float, bool)) or obj is None:
+                notes.append({"kind": "note", "payload": {"raw": obj}})
+            continue
+        typed = dispatch(obj) if dispatch else None
+        if typed:
+            for ev in typed:
+                notes.append({"kind": ev.pop("type", "note"), "payload": {"raw": ev.pop("raw", obj), **ev}})
+        else:
             notes.append({"kind": "note", "payload": {"raw": obj}})
     return notes
 
@@ -98,7 +175,7 @@ def build_events(
 
     emit("question", {"argv": argv})
     if output_text is not None:
-        for note in parse_stream(output_text):
+        for note in parse_stream(output_text, element):
             note["atom"], note["task"], note["element"], note["ts"] = atom, task_id, element, ts
             events.append(note)
         emit("answer", {"text": output_text})

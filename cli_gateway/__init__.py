@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 from . import events as _events
 
