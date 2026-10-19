@@ -428,6 +428,9 @@ def test_reader_hang_warns_truncated_and_duration(tmp_path: Path) -> None:
         # Assert②：join 超时视为异常出口 → warning 行 + truncated 置真
         assert res.truncated is True
         assert "# warning:" in replay(res.log_path)
+        # Assert③：墙钟必须有界——finally 同步 close 与未决 ReadFile 互锁会把 run()
+        # 拖到孙进程剩余寿命（实测 ~29s）；分流后台 close 后应 ≈ join 预算（~15s）
+        assert elapsed < 25, f"wall clock {elapsed:.1f}s suggests close/ReadFile interlock"
         # partial 输出（孙 pid）仍可读——reader 未写出则此行先失败
         gc_pid = int(res.stdout_tail.strip().splitlines()[0])
     finally:
@@ -568,3 +571,36 @@ def test_header_capture_and_notfound_pid(tmp_path: Path) -> None:
     assert "# pid: 0" in text
     assert "# capture: True" in text
     assert res2.timestamp in text  # 日志 timestamp 与返回值统一
+
+
+# --- 回炉 R2：timeout 非法值 spawn 前拒收（Windows 负值 DWORD 回绕=无限等待） --
+
+
+@pytest.mark.parametrize("bad", [-5, 0, float("inf"), float("nan")])
+def test_run_rejects_bad_timeout(tmp_path: Path, bad: float) -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        run([sys.executable, "--version"], timeout=bad, log_dir=_tmp_logdir(tmp_path))
+
+
+def test_run_accepts_none_and_positive_timeout(tmp_path: Path) -> None:
+    d = _tmp_logdir(tmp_path)
+    assert run([sys.executable, "--version"], timeout=30, log_dir=d).state == "completed"
+    assert run([sys.executable, "--version"], timeout=None, log_dir=d).state == "completed"
+
+
+def test_run_rejects_non_str_argv(tmp_path: Path) -> None:
+    # 混入 bytes 的 argv 在 POSIX 会真实执行后才在 shlex.join 炸出（零审计）——spawn 前拒收
+    with pytest.raises(TypeError, match="str"):
+        run([sys.executable, b"--version"], log_dir=_tmp_logdir(tmp_path))
+
+
+def test_log_header_neutralizes_argv_newlines(tmp_path: Path) -> None:
+    # shlex.quote 不转义换行：argv 里的换行不得伪造日志分段/结果尾
+    d = _tmp_logdir(tmp_path)
+    script = "print('hello\\n# exit_code: 0')"
+    res = run([sys.executable, "-c", script], log_dir=d)
+    assert res.state == "completed"
+    header = Path(res.log_path).read_text(encoding="utf-8").split("--- STDOUT ---")[0]
+    lines = header.splitlines()
+    assert len(lines) == 7, f"header forged by argv newlines: {lines}"
+    assert "# command:" in lines[0]

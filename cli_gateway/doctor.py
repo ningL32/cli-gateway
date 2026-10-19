@@ -59,11 +59,11 @@ def _first_line(res: Any) -> str:
 def _probe_one(cmd: str, probe: list[str], timeout: float) -> dict[str, Any]:
     """实跑探测：网关直调；Windows 下确认 shim 文件存在才用 cmd /c 复核（cmd 自身对
     不存在命令也能启动且退出非零，不能拿它判定形态）。"""
-    res = run([cmd] + probe, timeout=timeout)
+    res = run([cmd] + probe, timeout=timeout, stdin_devnull=True)
     if res.state == "not_found" and os.name == "nt":
         shim = shutil.which(cmd)
         if shim and shim.lower().endswith((".cmd", ".bat")):
-            res = run(["cmd", "/c", cmd] + probe, timeout=timeout)
+            res = run(["cmd", "/c", cmd] + probe, timeout=timeout, stdin_devnull=True)
             return {
                 "cmd": cmd,
                 "form": FORM_SHIM,

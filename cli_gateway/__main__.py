@@ -51,44 +51,50 @@ def main(argv: list[str] | None = None) -> int:
             except (OSError, ValueError):
                 pass
 
-    if args.cmd == "run":
-        # 切片写法：payload 为空列表时 args.payload[0] 会 IndexError，parser.error 永不可达
-        cmd = args.payload[1:] if args.payload[:1] == ["--"] else args.payload
-        if not cmd:
-            parser.error("run 需要一个命令")
-        res = run(cmd, timeout=args.timeout, log_dir=args.dir)
-        print(f"exit={res.exit_code} duration={res.duration_ms}ms log={res.log_path}")
-        if res.stdout_tail:
-            print(res.stdout_tail, end="")
-        if res.stderr_tail:
-            print(res.stderr_tail, end="", file=sys.stderr)
-        return 0 if res.success else 1
+    try:
+        if args.cmd == "run":
+            # 切片写法：payload 为空列表时 args.payload[0] 会 IndexError，parser.error 永不可达
+            cmd = args.payload[1:] if args.payload[:1] == ["--"] else args.payload
+            if not cmd:
+                parser.error("run 需要一个命令")
+            res = run(cmd, timeout=args.timeout, log_dir=args.dir)
+            print(f"exit={res.exit_code} duration={res.duration_ms}ms log={res.log_path}")
+            if res.stdout_tail:
+                print(res.stdout_tail, end="")
+            if res.stderr_tail:
+                print(res.stderr_tail, end="", file=sys.stderr)
+            # 透传真实退出码（124 超时 / 127 未找到等），调用方脚本可直接判断
+            return 0 if res.success else (res.exit_code or 1)
 
-    if args.cmd == "replay":
-        print(replay(args.log_path))
-        return 0
+        if args.cmd == "replay":
+            print(replay(args.log_path))
+            return 0
 
-    if args.cmd == "logs":
-        for p in list_logs(args.dir):
-            print(p)
-        return 0
+        if args.cmd == "logs":
+            for p in list_logs(args.dir):
+                print(p)
+            return 0
 
-    if args.cmd == "doctor":
-        rows = doctor(commands=args.only, probe=not args.no_probe, timeout=args.timeout)
-        if args.json:
-            print(json.dumps(rows, ensure_ascii=False, indent=2))
-        else:
-            print(f"cli-gateway doctor  {platform.platform()}  python {sys.version.split()[0]}")
-            for r in rows:
-                mark = "✅" if r["ok"] else "❌"
-                ver = r["version"] or "-"
-                dur = f"  {r['duration_ms']}ms" if r["duration_ms"] is not None else ""
-                print(f"  {mark} {r['name']:<10} {r['form']}  |  {ver}{dur}")
-                if r["form"] == "npm shim（需 cmd /c 包装）":
-                    print(f"      └─ 网关调用配方：cmd /c {r['cmd']} ...（Git Bash 写 //c）")
-            ok_n = sum(1 for r in rows if r["ok"])
-            print(f"\n{ok_n}/{len(rows)} 可用；探测日志已落盘 {DEFAULT_LOG_DIR}")
-        return 0 if all(r["ok"] for r in rows) else 1
+        if args.cmd == "doctor":
+            rows = doctor(commands=args.only, probe=not args.no_probe, timeout=args.timeout)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            else:
+                print(f"cli-gateway doctor  {platform.platform()}  python {sys.version.split()[0]}")
+                for r in rows:
+                    mark = "✅" if r["ok"] else "❌"
+                    ver = r["version"] or "-"
+                    dur = f"  {r['duration_ms']}ms" if r["duration_ms"] is not None else ""
+                    print(f"  {mark} {r['name']:<10} {r['form']}  |  {ver}{dur}")
+                    if r["form"] == "npm shim（需 cmd /c 包装）":
+                        print(f"      └─ 网关调用配方：cmd /c {r['cmd']} ...（Git Bash 写 //c）")
+                ok_n = sum(1 for r in rows if r["ok"])
+                print(f"\n{ok_n}/{len(rows)} 可用；探测日志已落盘 {DEFAULT_LOG_DIR}")
+            return 0 if all(r["ok"] for r in rows) else 1
+    except (OSError, ValueError, TypeError) as exc:
+        # 库层抛出的参数/环境错误给单行提示，不甩裸 traceback
+        print(f"cli-gateway: {exc}", file=sys.stderr)
+        return 2
 
     return 0
 

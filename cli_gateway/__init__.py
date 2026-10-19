@@ -14,6 +14,7 @@ GatewayResult.state ∈ {completed, timed_out, not_found, spawn_error, killed}
 from __future__ import annotations
 
 import codecs
+import math
 import os
 import shlex
 import signal
@@ -27,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 DEFAULT_LOG_DIR = Path(os.environ.get("CLI_GATEWAY_LOG_DIR", "~/.cli-gateway/logs")).expanduser()
 
@@ -38,7 +39,7 @@ _EXIT_NOT_FOUND = 127     # shell 惯例：命令未找到
 _EXIT_SPAWN_ERROR = 126   # shell 惯例：找到但无法启动/不可执行
 _EXIT_TIMEOUT = 124       # shell 惯例：超时
 _SPAWN_FAILURE_STATES = ("not_found", "spawn_error")  # 允许重试的"启动前失败"
-_SENSITIVE_MARKS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL")
+_SENSITIVE_MARKS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "PAT", "AUTH")
 
 
 @dataclass
@@ -173,13 +174,15 @@ def _close_in_background(pipe) -> None:
     threading.Thread(target=_close_quietly, args=(pipe,), daemon=True).start()
 
 
-def _pump(pipe, out) -> None:
+def _pump(pipe, out, errors: list[str]) -> None:
     """reader 线程体：边读管道边写盘（流式 tee）。
 
     buffering=0：每块立即落盘，主线程稍后取 tail / 组装日志时不依赖 reader 的
     Python 层缓冲被刷出（reader 卡死场景下 partial 依然可读）。
     out 为 None（part 打开失败，如磁盘满）时纯排水：仍消费管道，防止子进程
     因管道满而阻塞——排水是 reader 的硬职责，落盘是尽力而为。
+    意外异常（非 OSError/ValueError 的并发关闭类）记入共享 errors，结果侧显式
+    标记截断——reader 悄悄死掉等于观测层说谎。
     """
     try:
         if out is not None:
@@ -193,6 +196,8 @@ def _pump(pipe, out) -> None:
                 pass
     except (OSError, ValueError):
         pass  # 管道被并发关闭等场景，尽力而为
+    except Exception as exc:  # noqa: BLE001 - reader 意外死亡必须留痕
+        errors.append(f"reader crashed: {type(exc).__name__}: {exc}")
     finally:
         if out is not None:
             _close_quietly(out)
@@ -211,9 +216,10 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 capture_output=True,
                 check=False,  # 进程可能刚好自行退出，容忍 taskkill 失败
+                timeout=10,  # taskkill 走 RPC，卡死不得拖垮 run() 的兜底链
             )
-        except OSError:
-            pass  # taskkill 本身缺失/不可启动：交由 finally 的 proc.wait 兜底
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # taskkill 缺失/卡死：交由后续 proc.wait 兜底
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -235,10 +241,11 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
             pass
     try:
         proc.wait(timeout=_KILL_GRACE_S)
-        return
     except subprocess.TimeoutExpired:
         pass
     if pgid is not None:
+        # 无条件补刀 SIGKILL：直接子进程可能在宽限期内先死，而 TERM 免疫的
+        # 孙进程仍占着进程组——跳过补刀会让它永久存活并拖住管道。
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
@@ -250,15 +257,24 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
 
 
 def _guard_inputs(cmd: Sequence[str], cwd: str | os.PathLike | None) -> list[str]:
-    """入参守卫：str 拒收（防拆字符）、空列表拒收、cwd 前置校验（防误报 not found）。"""
+    """入参守卫：str 拒收（防拆字符）、空列表拒收、元素类型校验、cwd 前置校验。"""
     if isinstance(cmd, str):
         raise TypeError("cmd 必须是参数序列（如 ['echo', 'hi']），不要传字符串")
     argv = list(cmd)
     if not argv:
         raise ValueError("cmd 不能为空列表")
+    if not all(isinstance(a, str) for a in argv):
+        # 混入 bytes/int 的 argv 在 POSIX 会真实执行后才在 shlex.join 处炸出——
+        # 命令跑了却零审计条目，违反"有调用必有审计"契约，必须在 spawn 前拒收
+        raise TypeError("cmd 的每个元素都必须是 str")
     if cwd is not None and not Path(cwd).is_dir():
         raise FileNotFoundError(f"cwd does not exist: {cwd}")
     return argv
+
+
+def _one_line(s: str) -> str:
+    """审计头字段必须单行：argv 含换行会伪造日志分段/结果尾（shlex.quote 不转义换行）。"""
+    return s.replace("\r", " ").replace("\n", " ")
 
 
 def _header_lines(
@@ -272,7 +288,7 @@ def _header_lines(
 ) -> list[str]:
     """日志元数据头（capture=False 时"没输出"与"没采集"可区分）。"""
     return [
-        f"# command: {shlex.join(argv)}",
+        f"# command: {_one_line(shlex.join(argv))}",
         f"# timestamp: {started_at}",
         f"# pid: {pid}",
         f"# capture: {capture}",
@@ -354,7 +370,7 @@ def _assemble_log(
 
     newline=""：禁用 Windows 文本模式换行翻译，part 里的 CRLF 原样落盘（不膨胀成 CRCRLF）。
     """
-    with open(log_path, "w", encoding="utf-8", errors="replace", newline="") as f:
+    with open(_norm_log_path(log_path), "w", encoding="utf-8", errors="replace", newline="") as f:
         for line in header:
             f.write(line + "\n")
         f.write("--- STDOUT ---\n")
@@ -390,6 +406,7 @@ def _run_once(
     capture: bool,
     tail: int,
     env: Mapping[str, str] | None,
+    stdin_devnull: bool = False,
 ) -> GatewayResult:
     """单次尝试：spawn → 流式 tee → 终止/收尾 → 组装日志 → 结构化返回。"""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -417,6 +434,7 @@ def _run_once(
             argv,
             cwd=str(cwd) if cwd else None,
             env=merged_env,
+            stdin=subprocess.DEVNULL if stdin_devnull else None,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
             **popen_kwargs,
@@ -434,43 +452,53 @@ def _run_once(
             "spawn_error", _EXIT_SPAWN_ERROR, f"spawn failed: {exc}",
         )
 
-    # 流式 tee：两个 reader 线程边读边写盘（part 在主线程打开后移交，失败则纯排水）
+    # 流式 tee：两个 reader 线程边读边写盘（part 在主线程打开后移交，失败则纯排水）。
+    # 装配段整体置于 try/finally 内：spawn 成功后任何一步炸出（线程耗尽等）都必须
+    # 走兜底（杀活进程/关管道/清 part），不得留孤儿进程或零审计穿出 run()。
     pipes = [p for p in (proc.stdout, proc.stderr) if p is not None]
     readers: list[threading.Thread] = []
-    if capture:
-        for pipe, part in ((proc.stdout, stdout_part), (proc.stderr, stderr_part)):
-            try:
-                out = open(_norm_log_path(part), "wb", buffering=0)
-            except OSError:
-                out = None  # 磁盘满/杀软拦截等：放弃落盘，但排水不停（防管道满死锁）
-            t = threading.Thread(target=_pump, args=(pipe, out), daemon=True)
-            t.start()
-            readers.append(t)
+    reader_errors: list[str] = []
+    part_open_failed = False
 
     result: GatewayResult
     try:
+        if capture:
+            for pipe, part in ((proc.stdout, stdout_part), (proc.stderr, stderr_part)):
+                try:
+                    out = open(_norm_log_path(part), "wb", buffering=0)
+                except OSError:
+                    out = None  # 磁盘满/杀软拦截等：放弃落盘，但排水不停（防管道满死锁）
+                    part_open_failed = True
+                t = threading.Thread(target=_pump, args=(pipe, out, reader_errors), daemon=True)
+                t.start()
+                readers.append(t)
+
         # 等进程结束或超时（reader 持续排水，wait 不会因管道满而死锁）
         timed_out = False
         try:
             returncode = proc.wait(timeout=timeout)
+            # duration 定格于终态达成时——杀树/收 reader 的成本不得计入
+            duration_ms = int((time.monotonic() - start) * 1000)
         except subprocess.TimeoutExpired:
             timed_out = True
+            duration_ms = int((time.monotonic() - start) * 1000)
             _terminate_process_group(proc)
             returncode = proc.returncode
 
-        # duration 在 wait 返回即定格——reader join（孙进程继承写句柄时可能打满超时）不得计入
-        duration_ms = int((time.monotonic() - start) * 1000)
-
-        # 收 reader：正常 EOF 立即返回；打满宽限即异常出口
+        # 收 reader：共享 deadline（并行预算）——单个 hung 不得吃掉其他线程的 join 时间
+        join_deadline = time.monotonic() + _READER_JOIN_S
         for t in readers:
-            t.join(timeout=_READER_JOIN_S)
-        readers_hung = any(t.is_alive() for t in readers)
-        if readers_hung:
+            t.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        if any(t.is_alive() for t in readers):
             # 孙进程继承管道写端 → 管道不 EOF。后台关管道解堵（防 close 挂死主线程）。
             for p in pipes:
                 _close_in_background(p)
+            grace_deadline = time.monotonic() + 5
             for t in readers:
-                t.join(timeout=5)
+                t.join(timeout=max(0.0, grace_deadline - time.monotonic()))
+        # join 后复评而非初判定终身：等待期间孙进程退场/管道解堵后 reader 可能已
+        # 恢复收尾，输出其实是完整的——误报 truncated 会误导调用方丢弃有效结果
+        readers_hung = any(t.is_alive() for t in readers)
 
         if timed_out:
             state, exit_code = "timed_out", _EXIT_TIMEOUT
@@ -490,6 +518,8 @@ def _run_once(
             trailer.append(
                 "# warning: reader did not finish (descendant may hold the pipe); output may be incomplete"
             )
+        for err in reader_errors[:2]:
+            trailer.append(f"# warning: {err}")
 
         header = _header_lines(argv, started_at, proc.pid, cwd, env, timeout, capture)
 
@@ -516,8 +546,8 @@ def _run_once(
         else:
             stdout_tail = stderr_tail = ""
             truncated = assembly_error is not None  # 组装失败=输出不完整
-        if readers_hung:
-            truncated = True  # reader 未正常收尾，输出可能撕裂，显式告警
+        if readers_hung or reader_errors or part_open_failed:
+            truncated = True  # reader 异常出口/落盘通道残缺，输出可能不完整，显式告警
 
         result = GatewayResult(
             command=shlex.join(argv),
@@ -542,8 +572,13 @@ def _run_once(
                 _terminate_process_group(proc)
         except Exception:
             pass
-        for p in pipes:
-            _close_quietly(p)
+        # reader 仍阻塞时同步 close 会与其未决 ReadFile 互锁挂死主线程
+        # （Windows 实测：close 时长 = 孙进程剩余寿命）——该场景交后台线程收尾
+        for i, p in enumerate(pipes):
+            if i < len(readers) and readers[i].is_alive():
+                _close_in_background(p)
+            else:
+                _close_quietly(p)
         for part in (stdout_part, stderr_part):
             try:
                 part.unlink(missing_ok=True)
@@ -563,6 +598,7 @@ def run(
     tail: int = 2000,
     env: Mapping[str, str] | None = None,
     retry_count: int = 0,
+    stdin_devnull: bool = False,
 ) -> GatewayResult:
     """执行一条 CLI 命令，全量落盘并返回结构化结果。
 
@@ -573,8 +609,13 @@ def run(
       审计仅记录显式传入项（敏感值脱敏）
     - retry_count 只对"启动前失败"（not_found / spawn_error）重试；
       超时/非零退出绝不自动重试；每次尝试独立日志
+    - stdin_devnull=True 时子进程 stdin 接 DEVNULL（无人值守/探测场景防交互挂起）
     - 纯本地 subprocess，不发起任何网络请求
     """
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        # 非法值必须在 spawn 前拒收，不能交给平台各自解释：Windows 负值经 DWORD
+        # 回绕等效无限等待（超时契约静默失效），POSIX 却是立即杀
+        raise ValueError(f"timeout 必须为正的有限数值或 None（不限时），收到 {timeout!r}")
     argv = _guard_inputs(cmd, cwd)
 
     log_root = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
@@ -591,6 +632,7 @@ def run(
             capture=capture,
             tail=tail,
             env=env,
+            stdin_devnull=stdin_devnull,
         )
         if result.state not in _SPAWN_FAILURE_STATES or attempt == attempts - 1:
             break  # 只有启动前失败才重试
@@ -634,7 +676,13 @@ def list_logs(log_dir: str | os.PathLike | None = None) -> list[Path]:
     root = Path(log_dir) if log_dir else DEFAULT_LOG_DIR
     if not root.is_dir():
         return []
-    return sorted(root.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0  # 并发清理/轮转把日志删了：不崩列表，排最后
+
+    return sorted(root.glob("*.log"), key=_mtime, reverse=True)
 
 
 __all__ = [
