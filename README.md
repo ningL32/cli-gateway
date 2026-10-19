@@ -1,5 +1,7 @@
 # cli-gateway
 
+[English](README.en.md) | 简体中文
+
 统一 CLI 进程调用网关：让"AI 调 CLI 是否真跑、输出能否逐字核对"变得可观测、可审计、可回放。
 
 **v1 定位**：本地 subprocess 薄包装。不涉及任何 URL/网络请求。
@@ -124,63 +126,22 @@ task_formula(atoms)                                # 'claude×1 + codex×1'
 
 **谱线现状**：claude（`--output-format stream-json --verbose`）与 codex（`exec --json`）为 jsonl 离散谱，且已**类型化**——事件 kind 为 `system` / `text` / `tool_call` / `tool_result` / `reasoning` / `result` / `error`（assistant 消息里的 tool_use 块 → tool_call 事件，对话树可重建）。claude 的 schema 来自真机实测；codex 工具类 item 的字段名为推测实现（宽容兜底，待真任务样本回填）。未收录形态退化为 `note` 兜底，**payload.raw 永远保留**；原始字节始终以 raw 日志为准。
 
-**边界**：answer 事件含输出全文，适合中小输出（超大输出的流式事件化留待后续）；spawn 失败的调用不写 sidecar（raw 日志仍有完整记录）。
+**边界（v1.7 内存有界）**：sidecar 流式写入——逐行解析谱线，全程只持一行；answer 事件不再内嵌全文，改为 `text_ref` 外置引用（指回 raw 日志）+ 500 字符 preview，需要全文时用 `answer_text()` 按需显式取。spawn 失败的调用不写 sidecar（raw 日志仍有完整记录）。
+
+### 对话树与分子可视化（实验性）
+
+```bash
+cli-gateway task fix-login --tree          # 对话树：每个原子的类型化事件缩进渲染（--all 含 system）
+cli-gateway task fix-login --graph > molecule.json   # 分子数据 JSON（nodes/links/formula）
+cli-gateway task fix-login --html  > galaxy.html     # 自包含 HTML 球棍模型，双击即开
+cli-gateway serve                          # 本机实时分子宇宙（127.0.0.1:7817，5s 轮询）
+```
+
+`--html` 单文件离线可用：暗色星野、元素色卡辉光球（半径 ∝ 耗时、timed_out 虚线裂解环）、元素色渐变化学键（粗细 ∝ 数据流量）+ 方向箭头 + 流量徽章、点击原子下钻事件流。`serve` 为本机 127.0.0.1 只读视图（星系/分子两态、运行中任务绿色脉动），非多用户 Web 产品。以上均为**实验性**，UI 与 schema 可能调整。
 
 ## 子智能体编队（agents/）
 
-[agents/](agents/) 内置 9 个编码 CLI 的 **ZCode 子代理操作员提示词**——上表 9 个 CLI 各配一个"专属操作员"：主会话（工头）负责拆解派工与验收，子代理通过 Bash 调用对应 CLI 真进程干活。方法论（C4/ADR/TDD/变异测试/八维审查等）全部内置在提示词里，开箱即用。
-
-| 文件 | 角色 | 擅长 |
-|---|---|---|
-| [claude.md](agents/claude.md) | 首席架构 | C4/ADR 架构规格、多维评审、技术决策 |
-| [codex.md](agents/codex.md) | 资深攻坚 | 五 Why 根因、性能剖析、Strangler Fig 重构 |
-| [opencode.md](agents/opencode.md) | 全栈 | React/Next + Node/Python + DB 前后端通吃 |
-| [mcode.md](agents/mcode.md) | 功能实现 | TDD 红绿重构一棒到底 |
-| [kilo.md](agents/kilo.md) | 功能实现 | 补位实现、修测试、环境坑 |
-| [crush.md](agents/crush.md) | 功能实现 | 快速编码、LSP 语义辅助 |
-| [goose.md](agents/goose.md) | QA | 测试金字塔、Playwright 真机验证、变异测试防假绿 |
-| [qoder.md](agents/qoder.md) | 代码评审 | 八维审查、异构模型交叉复核 |
-| [hermes.md](agents/hermes.md) | 研究员 | 技术调研、复盘 postmortem、经验库回写 |
-
-### 安装
-
-```bash
-# 用户级（所有项目生效）
-cp agents/*.md ~/.zcode/agents/
-
-# 或项目级（仅当前项目生效）
-cp agents/*.md .zcode/agents/
-```
-
-重启 ZCode 会话后生效，Agent 工具即可按 `name` 派工（如 `subagent_type: "codex"`）。其他支持自定义子代理的框架同样可用：这些 `.md` 本质是"角色化操作员提示词 + 调用配方"，粘贴为任意 agent 的系统提示词即可复用。
-
-### 使用
-
-主会话按岗位派工，派单三要素（目标/范围/完成标准）写清，例如：
-
-```markdown
-# 任务
-修复 tests/test_api.py 中 3 个失败用例（并发写竞态）
-
-# 完成标准
-pytest 全绿 + 亲自运行过验证命令
-
-# 约束
-只改 src/worker.py，不动接口签名
-```
-
-子代理按固定三段式汇报（修改了什么 / 如何验证 / 哪些仍未验证）；经 cli-gateway 留证调用的，汇报附 `log=` 路径，验收方 `cli-gateway replay <log>` 逐字回放复核——**验收不轻信汇报文字**。
-
-### 提示词结构（自定义时照此改）
-
-每个文件的固定骨架：`frontmatter`（`name` 派工标识 / `description` 主会话路由依据 / `tools` 工具白名单 / `injectAgentsMd`）+ 正文（岗位定位与方法论 / 完成条件 / 预检三问 / 固定汇报格式 / 退化路径 / 调用方式含 cli-gateway 留证配方 / 红线 / 实测档案）。
-
-### 定制指引
-
-- **CLI 名称/版本不同**：改「调用方式」节的命令与核对版本即可，方法论不绑定具体 CLI
-- **后端不是 GLM**：这些操作员原本跑在 GLM 后端，换 provider 只需改 CLI 侧的 provider 配置，提示词无需动
-- **POSIX 环境**：调用配方中 `cmd //c` 包装与 MSYS 注意事项仅适用 Windows + Git Bash，POSIX 直接写命令名
-- **开源版说明**：`agents/` 为脱敏模板（团队名/内网配置/实测记录已替换为占位或通用表述），各文件末尾的「实测档案」留作你的团队自行回写
+9 个编码 CLI 的 ZCode 子代理操作员提示词（首席架构/攻坚/全栈/TDD/QA/评审/研究员），内置经网关留证的调用配方与完整方法论——详见 [agents/README.md](agents/README.md)。
 
 ## 超时与进程组
 
@@ -190,10 +151,10 @@ POSIX 下进程被信号杀死时 `state="killed"`、`exit_code` 为负信号值
 
 输出读取统一按 UTF-8（`errors="replace"`），日志始终是合法 UTF-8。gateway 默认向子进程注入 `PYTHONUTF8=1`（调用方或父环境已显式设置该变量时不覆盖），使 python 类子进程在 Windows 传统代码页（CP936 等）环境下也输出 UTF-8——注意子进程会看到这个变量。
 
-## 设计边界（v1）
+## 设计边界
 
-- **只做本地 subprocess**，不发起 URL/网络请求——未来 v2 若加远程/HTTP 能力，服务端请求 URL 时仅允许 http/https，且发请求前校验 host、拒绝 localhost/环回/私有/保留地址；
-- 不做沙箱（用 Docker 的 MCP 网关管沙箱，见下）；不做 Web UI；不做多租户。
+- **只做本地 subprocess**，不发起任何网络请求——未来 v2 若加远程/HTTP 能力，服务端请求 URL 时仅允许 http/https，且发请求前校验 host、拒绝 localhost/环回/私有/保留地址；
+- 不做沙箱（用 Docker 的 MCP 网关管沙箱，见下）；不做多用户 Web 产品（`serve` 例外：仅绑定 127.0.0.1 的本机只读日志视图，零外部请求）。
 
 ## 与 docker/mcp-gateway 的关系（不同层）
 
