@@ -13,13 +13,23 @@ import json
 import platform
 import sys
 
-from . import DEFAULT_LOG_DIR, list_logs, read_events, replay, run, task_atoms, task_formula
+from . import (
+    DEFAULT_LOG_DIR,
+    __version__,
+    list_logs,
+    read_events,
+    replay,
+    run,
+    task_atoms,
+    task_formula,
+)
 from .doctor import doctor
 from .events import render_atom_tree
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cli-gateway", description="统一 CLI 进程调用网关")
+    parser.add_argument("--version", action="version", version=f"cli-gateway {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="执行一条命令并全量落盘")

@@ -2,6 +2,12 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本遵循语义化版本。
 
+## [1.4.1] - 2026-10-19
+
+### Added
+
+- CLI `--version`：打印 `cli-gateway <版本>`——下游（FdeHarness `lib/gateway.js` 适配器）的版本探测不再需要 `pip show` 兜底
+
 ## [1.4.0] - 2026-10-19
 
 ### Added — task --tree：对话树渲染

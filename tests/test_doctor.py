@@ -12,7 +12,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from cli_gateway.__main__ import main  # noqa: E402
 from cli_gateway.doctor import DOCTOR_SPECS, _find_exe, doctor  # noqa: E402
+
+
+def test_cli_version_flag() -> None:
+    # FdeHarness 适配器的版本探测此前被迫走 pip show 兜底——--version 补齐后直接可用
+    with pytest.raises(SystemExit) as ei:
+        main(["--version"])
+    assert ei.value.code == 0
 
 
 def test_doctor_specs_shape() -> None:
