@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cli_gateway import (  # noqa: E402
+    answer_text,
     read_events,
     run,
     task_atoms,
@@ -179,7 +180,13 @@ def test_observe_writes_sidecar_with_atom_events(tmp_path: Path) -> None:
     # 原子不可分：question 携带完整 argv，answer 携带全文，exit 携带结合证据
     assert events[0]["payload"]["argv"][-1] == "print('hello-observe')"
     answer = next(e for e in events if e["kind"] == "answer")
-    assert "hello-observe" in answer["payload"]["text"]
+    # v1.7 内存有界：answer 外置引用（text_ref 指回 raw 日志）+ 有界 preview；
+    # 全文经 answer_text() 按需显式取（消费方自决承担内存）
+    assert "hello-observe" in answer["payload"]["preview"]
+    assert len(answer["payload"]["preview"]) <= 500
+    assert "text" not in answer["payload"]  # 不再内嵌全文
+    assert answer["payload"]["text_ref"]["log"] == res.log_path
+    assert "hello-observe" in answer_text(events)
     exit_ev = events[-1]
     assert exit_ev["payload"]["exit_code"] == 0 and exit_ev["payload"]["state"] == "completed"
     # 元数据：task 绑定 + 元素 + 谱线类型都落在事件与日志头
@@ -389,6 +396,24 @@ def test_serve_api_galaxy_and_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_answer_streaming_bounded_for_large_output(tmp_path: Path) -> None:
+    # 内存有界契约：大输出时 sidecar 只存 500 字符 preview，全文走 answer_text 按需读
+    d = _tmp_logdir(tmp_path)
+    res = run(
+        [sys.executable, "-c", "print('A' * 5000)"],
+        log_dir=d,
+        observe=True,
+        task_id="T-big",
+    )
+    assert res.state == "completed"
+    events = read_events(res.log_path + ".events.jsonl")
+    ans = next(e for e in events if e["kind"] == "answer")
+    assert len(ans["payload"]["preview"]) <= 500
+    assert "text" not in ans["payload"]
+    full = answer_text(events)
+    assert "A" * 5000 in full  # 全文可按需取回（守恒律：原文在 raw 日志里）
 
 
 def _capture_task_json(d: str, task_id: str) -> list[str]:

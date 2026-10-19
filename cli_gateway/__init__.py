@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
-__version__ = "1.6.2"
+__version__ = "1.7.0"
 
 from . import events as _events
 
@@ -585,28 +585,23 @@ def _run_once(
             env_overrides=_mask_env(env),
         )
 
-        # 观测模式：输出落盘后组装原子事件（question → [note…] → answer → exit）。
-        # 全文经 _tail_from_file 超大 tail 读取（复用存量 IO；适合中小输出，
-        # 超大输出的流式事件化留待后续版本）。
+        # 观测模式：输出落盘后流式组装原子事件（question → [note…] → answer → exit）。
+        # v1.7 内存有界：逐行读 part 解析，全程只持有一行；answer 不再内嵌全文——
+        # text_ref 外置引用指回 raw 日志（守恒律），有界 preview 供面板速览。
         if observe:
-            merged_output: str | None = ""
-            if capture:
-                out_text, _ = _tail_from_file(stdout_part, 2**31 - 1)
-                err_text, _ = _tail_from_file(stderr_part, 2**31 - 1)
-                merged_output = "\n".join(t for t in (out_text, err_text) if t)
-            _events.write_events(
+            _events.stream_events(
                 Path(str(log_path) + ".events.jsonl"),
-                _events.build_events(
-                    atom=log_path.stem,
-                    task_id=task_id,
-                    element=element,
-                    ts=started_at,
-                    argv=spawn_argv,
-                    output_text=merged_output,
-                    exit_code=exit_code,
-                    duration_ms=duration_ms,
-                    state=state,
-                ),
+                atom=log_path.stem,
+                log_path=log_path,
+                argv=spawn_argv,
+                task_id=task_id,
+                element=element,
+                ts=started_at,
+                stdout_part=stdout_part if capture else None,
+                stderr_part=stderr_part if capture else None,
+                exit_code=exit_code,
+                duration_ms=duration_ms,
+                state=state,
             )
     finally:
         # 兜底：杀活进程、关管道、清 part——异常/半途退出也不泄漏资源
@@ -752,6 +747,7 @@ __all__ = [
     "read_events",
     "task_atoms",
     "task_formula",
+    "answer_text",
 ]
 
 
@@ -768,3 +764,11 @@ def task_atoms(task_id: str, log_dir: str | os.PathLike | None = None) -> list[d
 def task_formula(atoms: list[dict]) -> str:
     """分子式：任务内元素组成配比，如 "claude×3 + codex×2"。"""
     return _events.task_formula(atoms)
+
+
+def answer_text(events: list[dict]) -> str:
+    """取 answer 全文（新 schema 走 text_ref 读 raw 日志，旧 schema 返回内嵌 text）。
+
+    显式调用 = 自愿承担全文内存；sidecar 里的 answer 只存外置引用 + 有界预览。
+    """
+    return _events.answer_text(events)

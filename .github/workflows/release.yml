@@ -17,6 +17,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Verify tag matches __version__ (防 1.4.0/1.6.2 漏 bump 事故)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pip install -e .
+          VER=$(python -c "import cli_gateway; print(cli_gateway.__version__)")
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "tag=v$TAG  __version__=$VER"
+          [ "$TAG" = "$VER" ] || { echo "::error::tag v$TAG != __version__ $VER —— 漏 bump，拒绝构建"; exit 1; }
       - name: Build sdist and wheel
         run: |
           pip install build

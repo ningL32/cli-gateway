@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,32 @@ def _typed_codex(obj: dict[str, Any]) -> list[dict[str, Any]]:
 _TYPED_DISPATCH = {"claude": _typed_claude, "codex": _typed_codex}
 
 
+def parse_line(line: str, element: str = "") -> list[dict[str, Any]]:
+    """单行谱线解析（流式场景逐行调用，内存有界）。返回事件片段列表（可能为空）。
+
+    守恒律分层：类型化解析器命中 → 语义事件；合法 JSON 不匹配 → note 透传；
+    非 JSON 行 → 空（全文由 answer 事件兜底）。payload.raw 永远保留。
+    """
+    line = line.strip()
+    if not line:
+        return []
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(obj, dict):
+        if isinstance(obj, (list, int, float, bool)) or obj is None:
+            return [{"kind": "note", "payload": {"raw": obj}}]
+        return []
+    # 配方与解读统一在周期表：parser 字段指向分派器，注册配方 = 注册解读
+    parser_name = ELEMENTS.get(element, {}).get("parser")
+    dispatch = _TYPED_DISPATCH.get(parser_name) if parser_name else None
+    typed = dispatch(obj) if dispatch else None
+    if typed:
+        return [{"kind": ev.pop("type", "note"), "payload": {"raw": ev.pop("raw", obj), **ev}} for ev in typed]
+    return [{"kind": "note", "payload": {"raw": obj}}]
+
+
 def parse_stream(text: str, element: str = "") -> list[dict[str, Any]]:
     """从输出文本提取结构化谱线事件：逐行 JSON，按元素分发类型化解析。
 
@@ -120,28 +147,10 @@ def parse_stream(text: str, element: str = "") -> list[dict[str, Any]]:
     reasoning/system/result/error）；行是合法 JSON 但不匹配已知 schema → note
     透传；非 JSON 行 → 忽略（全文由 answer 事件兜底）。payload.raw 永远保留。
     """
-    # 配方与解读统一在周期表：parser 字段指向分派器，注册配方 = 注册解读
-    parser_name = ELEMENTS.get(element, {}).get("parser")
-    dispatch = _TYPED_DISPATCH.get(parser_name) if parser_name else None
     notes: list[dict[str, Any]] = []
     for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(obj, dict):
-            if isinstance(obj, (list, int, float, bool)) or obj is None:
-                notes.append({"kind": "note", "payload": {"raw": obj}})
-            continue
-        typed = dispatch(obj) if dispatch else None
-        if typed:
-            for ev in typed:
-                notes.append({"kind": ev.pop("type", "note"), "payload": {"raw": ev.pop("raw", obj), **ev}})
-        else:
-            notes.append({"kind": "note", "payload": {"raw": obj}})
+        for ev in parse_line(line, element):
+            notes.append(ev)
     return notes
 
 
@@ -259,6 +268,104 @@ def render_atom_tree(events: list[dict]) -> list[str]:
         branch = "└─" if index == len(events) - 1 else "├─"
         lines.append(f"  {branch} {kind}: {summary}")
     return lines
+
+
+def stream_events(
+    sidecar: Path,
+    *,
+    atom: str,
+    log_path: Path,
+    argv: list[str],
+    task_id: str | None,
+    element: str,
+    ts: str,
+    stdout_part: Path | None,
+    stderr_part: Path | None,
+    exit_code: int | None,
+    duration_ms: int,
+    state: str,
+    preview_chars: int = 500,
+) -> int:
+    """流式写原子事件 sidecar（v1.7 内存有界）。
+
+    逐行读 part 解析谱线，全程只持有一行；answer 事件不再内嵌全文——改为
+    text_ref 外置引用（raw 日志本身就是全文）+ 有界 preview。返回事件数。
+    消费方需要全文时用 answer_text() 显式取（内存换信息，调用方自决）。
+    """
+    count = 0
+    meta = {"atom": atom, "task": task_id, "element": element, "ts": ts}
+    with open(Path(sidecar).resolve(), "w", encoding="utf-8", newline="") as f:
+        def emit(kind: str, payload: dict[str, Any]) -> None:
+            nonlocal count
+            rec = {"v": SCHEMA_VERSION, **meta, "seq": count, "kind": kind, "payload": payload}
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            count += 1
+
+        emit("question", {"argv": argv})
+        for part in (stdout_part, stderr_part):
+            if part is None:
+                continue
+            try:
+                with open(part, encoding="utf-8", errors="replace") as pf:
+                    for line in pf:
+                        for ev in parse_line(line, element):
+                            ev.update(meta)
+                            ev["seq"] = count
+                            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+                            count += 1
+            except OSError:
+                continue  # part 读不到（杀软/清理竞态）：谱线缺失，answer 兜底仍在
+        # answer：外置引用 + 有界预览（预览取 stdout 前 preview_chars 字符）
+        preview = ""
+        try:
+            if stdout_part is not None and stdout_part.is_file():
+                preview = stdout_part.read_text(encoding="utf-8", errors="replace")[:preview_chars]
+        except OSError:
+            preview = ""
+        emit(
+            "answer",
+            {
+                "text_ref": {"log": str(log_path), "streams": ["stdout", "stderr"]},
+                "preview": preview,
+            },
+        )
+        emit("exit", {"exit_code": exit_code, "duration_ms": duration_ms, "state": state})
+    return count
+
+
+def answer_text(events: list[dict[str, Any]]) -> str:
+    """从 answer 事件取全文：text_ref 指回 raw 日志（守恒律：原文在日志里）。
+
+    新 schema（text_ref）读取日志 STDOUT/STDERR 段合并；旧 schema（内嵌 text）
+    直接返回。调用方显式调用 = 自愿承担全文内存。
+    """
+    ans = next((e for e in events if e.get("kind") == "answer"), None)
+    if ans is None:
+        return ""
+    payload = ans.get("payload") or {}
+    if "text" in payload:
+        return str(payload["text"])
+    ref = payload.get("text_ref") or {}
+    log_path = ref.get("log")
+    if not log_path:
+        return str(payload.get("preview", ""))
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            full = f.read()
+    except OSError:
+        return str(payload.get("preview", ""))
+    out: list[str] = []
+    for section in ("STDOUT", "STDERR"):
+        marker = f"--- {section} ---"
+        start = full.find(marker)
+        if start < 0:
+            continue
+        start += len(marker)
+        end = full.find("--- END ---", start)
+        chunk = full[start:end if end > 0 else len(full)]
+        if chunk.strip():
+            out.append(chunk.strip("\n"))
+    return "\n".join(out)
 
 
 def write_events(sidecar: Path, events: list[dict[str, Any]]) -> None:
@@ -384,16 +491,14 @@ def build_graph(task_id: str, log_dir: str | Path | None = None) -> dict[str, An
             bond_id = a.get("bond", "")
             bond_idx = next((j for j, n in enumerate(nodes) if n["id"] == bond_id), None) if bond_id else None
             src = bond_idx if bond_idx is not None else i - 1
-            prev = atoms[src]
+            # 键的粗细 = 数据流量，以源原子的 sidecar 体量为代理（事件总量≈输出活动量）
             weight = 0
-            if prev["events_path"]:
+            src_events = atoms[src]["events_path"]
+            if src_events:
                 try:
-                    for e in read_events(prev["events_path"]):
-                        if e.get("kind") == "answer":
-                            weight = len((e.get("payload") or {}).get("text", "").encode("utf-8"))
-                            break
-                except (OSError, FileNotFoundError):
-                    pass
+                    weight = Path(src_events).stat().st_size
+                except OSError:
+                    weight = 0
             link = {"source": src, "target": i, "weight": weight}
             if bond_idx is not None:
                 link["explicit"] = True
@@ -408,11 +513,20 @@ def build_graph(task_id: str, log_dir: str | Path | None = None) -> dict[str, An
     }
 
 
-def galaxy(log_dir: str | Path | None = None) -> dict[str, Any]:
+_GALAXY_LOCK = threading.Lock()
+_GALAXY_INDEX: dict[str, dict[str, Any]] = {}   # str(path) -> {mtime, size, meta}
+_GALAXY_CACHE: dict[str, dict[str, Any]] = {}   # str(root) -> {at, data}
+
+
+def galaxy(
+    log_dir: str | Path | None = None,
+    ttl: float = 2.0,
+) -> dict[str, Any]:
     """星系扫描：全部日志按化合物分组 + 未绑定任务的游离原子（serve 首页数据源）。
 
-    tasks：按 # task: 头分组（含分子式/原子数/运行中数）；loose：无任务原子
-    （最新在前，截断 30 条）。运行中检测 = part 文件尚在。
+    v1.7 性能：mtime 增量索引——只有新出现或 mtime/size 变化的日志才重读头尾，
+    未变化的直接复用缓存（serve 5s 轮询下，IO 从 O(全部日志) 降到 O(变化量)）；
+    外层再叠 TTL 短缓存吸收高频轮询。线程安全（ThreadingHTTPServer 并发）。
     """
     from datetime import datetime as _dt
 
@@ -421,49 +535,82 @@ def galaxy(log_dir: str | Path | None = None) -> dict[str, Any]:
         from . import DEFAULT_LOG_DIR
 
         root = DEFAULT_LOG_DIR
+    now = _dt.now().isoformat(timespec="seconds")
+    if not root.is_dir():
+        return {"tasks": [], "loose": [], "generated_at": now}
+    key = str(root)
+    with _GALAXY_LOCK:
+        cached = _GALAXY_CACHE.get(key)
+        if cached and (_dt.now() - cached["at"]).total_seconds() < ttl:
+            return cached["data"]
     tasks: dict[str, dict[str, Any]] = {}
     loose: list[dict[str, Any]] = []
-    if not root.is_dir():
-        return {"tasks": [], "loose": [], "generated_at": _dt.now().isoformat(timespec="seconds")}
+    seen: set[str] = set()
     for log_path in sorted(root.glob("*.log"), reverse=True):
+        seen.add(str(log_path))
         try:
-            with open(log_path, encoding="utf-8", errors="replace") as f:
-                head = f.read(4096)
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - 2048))
-                tail = f.read()
+            st = log_path.stat()
         except OSError:
             continue
+        with _GALAXY_LOCK:
+            entry = _GALAXY_INDEX.get(str(log_path))
+        if entry and entry["mtime"] == st.st_mtime and entry["size"] == st.st_size:
+            meta = entry["meta"]
+        else:
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    head = f.read(4096)
+                    f.seek(0, 2)
+                    size = f.tell()
+                    f.seek(max(0, size - 2048))
+                    tail = f.read()
+            except OSError:
+                continue
 
-        def _field(prefix: str, section: str) -> str:
-            line = next((l for l in section.splitlines() if l.startswith(prefix)), "")
-            return line[len(prefix):].strip() if line else ""
+            def _field(prefix: str, section: str) -> str:
+                line = next((l for l in section.splitlines() if l.startswith(prefix)), "")
+                return line[len(prefix):].strip() if line else ""
 
-        _parts = log_path.stem.split("-")  # <日期>-<时间>-<命令首词>-<8hex>
-        element = _field("# element: ", head) or (_parts[2].removesuffix(".exe") if len(_parts) > 3 else "unknown")
-        running = log_path.with_suffix(".stdout.part").is_file()
+            _parts = log_path.stem.split("-")  # <日期>-<时间>-<命令首词>-<8hex>
+            meta = {
+                "element": _field("# element: ", head) or (_parts[2].removesuffix(".exe") if len(_parts) > 3 else "unknown"),
+                "task": _field("# task: ", head),
+                "exit": _field("# exit_code: ", tail),
+                "running": log_path.with_suffix(".stdout.part").is_file(),
+            }
+            with _GALAXY_LOCK:
+                _GALAXY_INDEX[str(log_path)] = {"mtime": st.st_mtime, "size": st.st_size, "meta": meta}
         atom = {
             "atom": log_path.stem,
-            "element": element,
-            "color": element_color(element),
-            "exit_code": (_field("# exit_code: ", tail) or None),
-            "running": running,
-            "task": _field("# task: ", head),
+            "element": meta["element"],
+            "color": element_color(meta["element"]),
+            "exit_code": meta["exit"] or None,
+            "running": meta["running"],
+            "task": meta["task"],
         }
         if atom["task"]:
             bucket = tasks.setdefault(atom["task"], {"task": atom["task"], "n": 0, "running": 0, "elements": Counter(), "last": atom["atom"]})
             bucket["n"] += 1
-            bucket["running"] += 1 if running else 0
-            bucket["elements"][element] += 1
+            bucket["running"] += 1 if meta["running"] else 0
+            bucket["elements"][meta["element"]] += 1
         else:
             if len(loose) < 30:
                 loose.append(atom)
-    task_list = []
-    for t in tasks.values():
-        counts = t.pop("elements")
-        task_list.append({**t, "formula": " + ".join(f"{k}×{v}" for k, v in counts.most_common())})
-    return {"tasks": task_list, "loose": loose, "generated_at": _dt.now().isoformat(timespec="seconds")}
+    with _GALAXY_LOCK:
+        for gone in list(_GALAXY_INDEX):
+            if gone not in seen:
+                _GALAXY_INDEX.pop(gone)  # 日志被清理/轮转：索引同步收缩
+        data = {
+            "tasks": [
+                {**{k: v for k, v in t.items() if k != "elements"},
+                 "formula": " + ".join(f"{k}×{v}" for k, v in t["elements"].most_common())}
+                for t in tasks.values()
+            ],
+            "loose": loose,
+            "generated_at": now,
+        }
+        _GALAXY_CACHE[key] = {"at": _dt.now(), "data": data}
+    return data
 
 
 def render_html(graph: dict[str, Any]) -> str:

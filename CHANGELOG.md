@@ -2,6 +2,19 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本遵循语义化版本。
 
+## [1.7.0] - 2026-10-19
+
+### Added — 攻坚三件套（性能/内存/流程）
+
+- **观测模式内存有界（v1.1"内存有界"承诺的补全）**：sidecar 写入改流式——逐行读 part 解析谱线，全程只持有一行；**answer 事件不再内嵌全文**，改为 `text_ref` 外置引用（指回 raw 日志，守恒律）+ 有界 500 字符 preview；新增 `answer_text()` 按需显式取全文（消费方自决承担内存）。大输出（MB 级）不再有内存翻倍
+- **galaxy() mtime 增量索引 + TTL 缓存（线程安全）**：serve 5s 轮询下 IO 从 O(全部日志) 降到 O(变化量)——只有新出现或 mtime/size 变化的日志才重读头尾；索引随日志清理同步收缩
+- **发布校验**：release workflow 在 tag 触发时校验 `tag == __version__`，漏 bump 直接拒绝构建（1.4.0/1.6.2 两次事故的自动化防复发）
+
+### Changed
+
+- `parse_stream` 拆出单行 `parse_line`（流式复用）；键粗细改以源原子 sidecar 体量为代理
+- 契约测试 67→68（answer 新 schema、大输出有界、全文取回）
+
 ## [1.6.2] - 2026-10-19
 
 > ⚠️ **流程教训（已入攻坚清单）**：本次发布首次暴露"漏 bump `__version__` → 构建出旧版本 wheel → PyPI 400 拒收重复版本"的链路缺口（1.4.0 同因缺失，被 1.4.1 掩盖）。待办：CI 校验 tag 与 `__version__` 一致。
