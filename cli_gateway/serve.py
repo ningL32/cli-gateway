@@ -148,9 +148,28 @@ function draw(){ctx.clearRect(0,0,cv.width,cv.height);
   if(!dragging)rotY+=spin;
   const proj=nodes.map((n,i)=>({...project(n.base),n,i}));
   if(mode==="task")for(const l of links){const a=proj[l.source],b=proj[l.target];if(!a||!b)continue;
-    ctx.strokeStyle="rgba(100,116,139,"+(0.12+Math.min(0.45,(l.weight||200)/8000))+")";
-    ctx.lineWidth=0.8+Math.min(3.2,(l.weight||200)/2500);
-    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}
+    // 化学键 = 元素色渐变棍 + 双层描边发光 + 方向箭头 + 流量徽章
+    // （不用 shadowBlur——每帧逐键阴影描边会拖垮帧率）
+    const wgt=l.weight||0, ca=a.n.color||"#94a3b8", cb=b.n.color||"#94a3b8";
+    const grad=ctx.createLinearGradient(a.x,a.y,b.x,b.y);
+    grad.addColorStop(0,ca); grad.addColorStop(1,cb);
+    const wBase=2.5+Math.min(6,wgt/6000);
+    ctx.save();
+    ctx.globalAlpha=0.16; ctx.strokeStyle=grad; ctx.lineWidth=wBase*2.6;
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+    ctx.globalAlpha=0.62+Math.min(0.33,wgt/20000); ctx.lineWidth=wBase;
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+    ctx.restore();
+    const t=.68, ax=a.x+(b.x-a.x)*t, ay=a.y+(b.y-a.y)*t;
+    const ang=Math.atan2(b.y-a.y,b.x-a.x), ah=6;
+    ctx.fillStyle="rgba(226,232,240,.85)";
+    ctx.beginPath();
+    ctx.moveTo(ax+Math.cos(ang)*ah,ay+Math.sin(ang)*ah);
+    ctx.lineTo(ax+Math.cos(ang+2.5)*ah,ay+Math.sin(ang+2.5)*ah);
+    ctx.lineTo(ax+Math.cos(ang-2.5)*ah,ay+Math.sin(ang-2.5)*ah);
+    ctx.closePath();ctx.fill();
+    if(wgt>0){ctx.fillStyle="rgba(148,163,184,.8)";ctx.font="9px system-ui";ctx.textAlign="center";
+      ctx.fillText(fmtBytes(wgt),(a.x+b.x)/2,(a.y+b.y)/2-7);}}
   proj.sort((a,b)=>b.z-a.z).forEach(p=>{const n=p.n;
     const r=(mode==="task"?8+Math.min(26,(n.duration_ms||1000)/4000):13+Math.min(30,(n.n||1)*7))*p.f;
     p.sr=r;
@@ -168,8 +187,9 @@ function draw(){ctx.clearRect(0,0,cv.width,cv.height);
   requestAnimationFrame(draw);}
 draw();
 
-function setNodes(list){const pts=spiral(list.length);
-  nodes=list.map((n,i)=>({...n,base:pts[i]}));}
+function fmtBytes(n){return n>=1048576?(n/1048576).toFixed(1)+"MB":n>=1024?(n/1024).toFixed(1)+"KB":n+"B";}
+function setNodes(list){const scale=mode==="task"?0.72:1;const pts=spiral(list.length);
+  nodes=list.map((n,i)=>({...n,base:pts[i].map(v=>v*scale)}));}
 
 async function loadGalaxy(){mode="galaxy";view=null;nodes=[];links=[];
   document.getElementById("back").style.display="none";
@@ -194,6 +214,7 @@ async function loadTask(id){mode="task";view=id;links=[];
   const d=await (await fetch("/api/graph?task="+encodeURIComponent(id))).json();
   if(!d.nodes){setNodes([]);return;}
   document.getElementById("meta").textContent=d.formula+" · "+d.nodes.length+" atoms · generated "+d.generated_at;
+  links=d.links||[];  // 化学键数据（此前遗漏赋值——棍永远画不出来的根因）
   setNodes(d.nodes);
   const els=[...new Set(d.nodes.map(n=>n.element))];
   document.getElementById("legend").innerHTML="元素色卡："+els.map(e=>{
