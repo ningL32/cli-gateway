@@ -367,6 +367,8 @@ def test_serve_api_galaxy_and_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     d = _tmp_logdir(tmp_path)
     run([sys.executable, "-c", "print('srv')"], log_dir=d, observe=True, task_id="T-serve")
     httpd = make_server(port=0, log_dir=d)  # 端口 0 = 系统分配，测试无冲突
+    # SSRF 边界自证：被测服务端只绑环回，下面的请求永远指向测试自身实例
+    assert httpd.server_address[0] == "127.0.0.1"
     port = httpd.server_address[1]
     th = threading.Thread(target=httpd.serve_forever, daemon=True)
     th.start()
