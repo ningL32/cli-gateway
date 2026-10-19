@@ -377,8 +377,14 @@ def build_graph(task_id: str, log_dir: str | Path | None = None) -> dict[str, An
                     node["question"] = str(argv[-1])[:160] if argv else ""
                     break
             node["preview"] = _atom_preview(evs)
+        node["running"] = bool(a.get("running"))
+        node["bond"] = a.get("bond", "")
         if i > 0:
-            prev = atoms[i - 1]
+            # 显式键优先（run --bond 指定输入来源），否则时序链（前一个原子）
+            bond_id = a.get("bond", "")
+            bond_idx = next((j for j, n in enumerate(nodes) if n["id"] == bond_id), None) if bond_id else None
+            src = bond_idx if bond_idx is not None else i - 1
+            prev = atoms[src]
             weight = 0
             if prev["events_path"]:
                 try:
@@ -388,7 +394,10 @@ def build_graph(task_id: str, log_dir: str | Path | None = None) -> dict[str, An
                             break
                 except (OSError, FileNotFoundError):
                     pass
-            links.append({"source": i - 1, "target": i, "weight": weight})
+            link = {"source": src, "target": i, "weight": weight}
+            if bond_idx is not None:
+                link["explicit"] = True
+            links.append(link)
         nodes.append(node)
     return {
         "task": task_id,
@@ -397,6 +406,64 @@ def build_graph(task_id: str, log_dir: str | Path | None = None) -> dict[str, An
         "nodes": nodes,
         "links": links,
     }
+
+
+def galaxy(log_dir: str | Path | None = None) -> dict[str, Any]:
+    """星系扫描：全部日志按化合物分组 + 未绑定任务的游离原子（serve 首页数据源）。
+
+    tasks：按 # task: 头分组（含分子式/原子数/运行中数）；loose：无任务原子
+    （最新在前，截断 30 条）。运行中检测 = part 文件尚在。
+    """
+    from datetime import datetime as _dt
+
+    root = Path(log_dir) if log_dir else None
+    if root is None:
+        from . import DEFAULT_LOG_DIR
+
+        root = DEFAULT_LOG_DIR
+    tasks: dict[str, dict[str, Any]] = {}
+    loose: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return {"tasks": [], "loose": [], "generated_at": _dt.now().isoformat(timespec="seconds")}
+    for log_path in sorted(root.glob("*.log"), reverse=True):
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                head = f.read(4096)
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 2048))
+                tail = f.read()
+        except OSError:
+            continue
+
+        def _field(prefix: str, section: str) -> str:
+            line = next((l for l in section.splitlines() if l.startswith(prefix)), "")
+            return line[len(prefix):].strip() if line else ""
+
+        _parts = log_path.stem.split("-")  # <日期>-<时间>-<命令首词>-<8hex>
+        element = _field("# element: ", head) or (_parts[2].removesuffix(".exe") if len(_parts) > 3 else "unknown")
+        running = log_path.with_suffix(".stdout.part").is_file()
+        atom = {
+            "atom": log_path.stem,
+            "element": element,
+            "color": element_color(element),
+            "exit_code": (_field("# exit_code: ", tail) or None),
+            "running": running,
+            "task": _field("# task: ", head),
+        }
+        if atom["task"]:
+            bucket = tasks.setdefault(atom["task"], {"task": atom["task"], "n": 0, "running": 0, "elements": Counter(), "last": atom["atom"]})
+            bucket["n"] += 1
+            bucket["running"] += 1 if running else 0
+            bucket["elements"][element] += 1
+        else:
+            if len(loose) < 30:
+                loose.append(atom)
+    task_list = []
+    for t in tasks.values():
+        counts = t.pop("elements")
+        task_list.append({**t, "formula": " + ".join(f"{k}×{v}" for k, v in counts.most_common())})
+    return {"tasks": task_list, "loose": loose, "generated_at": _dt.now().isoformat(timespec="seconds")}
 
 
 def render_html(graph: dict[str, Any]) -> str:
@@ -589,6 +656,7 @@ def task_atoms(task_id: str, log_dir: str | Path | None = None) -> list[dict[str
         exit_code = _field("# exit_code: ", tail)
         state = _field("# state: ", tail)
         duration = _field("# duration_ms: ", tail)
+        bond = _field("# bond: ", head)
         sidecar = Path(str(log_path) + ".events.jsonl")
         atoms.append(
             {
@@ -600,6 +668,10 @@ def task_atoms(task_id: str, log_dir: str | Path | None = None) -> list[dict[str
                 "exit_code": int(exit_code) if exit_code.lstrip("-").isdigit() else None,
                 "state": state or "unknown",
                 "duration_ms": int(duration) if duration.isdigit() else None,
+                # 显式化学键（run --bond <atom-id>）：本原子的输入来自哪个原子
+                "bond": bond or "",
+                # 运行中检测：part 文件尚在 = 进程仍在落盘（组装时删除）
+                "running": (log_path.with_suffix(".stdout.part")).is_file(),
             }
         )
     return atoms

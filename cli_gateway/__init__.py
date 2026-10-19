@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 from . import events as _events
 
@@ -411,6 +411,7 @@ def _run_once(
     stdin_devnull: bool = False,
     observe: bool = False,
     task_id: str | None = None,
+    bond: str | None = None,
 ) -> GatewayResult:
     """单次尝试：spawn → 流式 tee → 终止/收尾 → 组装日志 → 结构化返回。"""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -535,6 +536,8 @@ def _run_once(
         header = _header_lines(spawn_argv, started_at, proc.pid, cwd, env, timeout, capture)
         if task_id is not None:
             header.append(f"# task: {task_id}")
+        if bond:
+            header.append(f"# bond: {bond}")
         if observe:
             header.append(f"# element: {element}")
             header.append(f"# observe: {observe_format}")
@@ -641,6 +644,7 @@ def run(
     stdin_devnull: bool = False,
     observe: bool = False,
     task_id: str | None = None,
+    bond: str | None = None,
 ) -> GatewayResult:
     """执行一条 CLI 命令，全量落盘并返回结构化结果。
 
@@ -656,6 +660,8 @@ def run(
       事件流，并把本次调用写成原子事件 sidecar（<log>.events.jsonl：
       question/[note…]/answer/exit）；task_id 把多个原子绑定为一个任务（化合物），
       供 task_atoms()/CLI `task` 子命令检索
+    - bond=<atom-id> 显式化学键：声明本次调用的输入来自哪个原子（默认时序链），
+      build_graph 据此连线
     - 纯本地 subprocess，不发起任何网络请求
     """
     if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
@@ -681,6 +687,7 @@ def run(
             stdin_devnull=stdin_devnull,
             observe=observe,
             task_id=task_id,
+            bond=bond,
         )
         if result.state not in _SPAWN_FAILURE_STATES or attempt == attempts - 1:
             break  # 只有启动前失败才重试

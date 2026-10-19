@@ -25,6 +25,7 @@ from . import (
 )
 from .doctor import doctor
 from .events import build_graph, render_atom_tree, render_html
+from .serve import serve
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
     p_task.add_argument("--json", action="store_true", help="结构化 JSON 输出")
     p_task.add_argument("--graph", action="store_true", help="分子数据 JSON（nodes/links/formula，球棍模型数据面）")
     p_task.add_argument("--html", action="store_true", help="自包含 HTML 球棍模型（打印到 stdout，重定向到 .html 文件后双击打开）")
+
+    p_serve = sub.add_parser("serve", help="分子宇宙实时视图（仅本机；星系/分子两态，5s 刷新）")
+    p_serve.add_argument("--port", type=int, default=7817, help="监听端口（默认 7817）")
+    p_serve.add_argument("--dir", default=None, help="日志目录（默认 ~/.cli-gateway/logs）")
     p_task.add_argument("--tree", action="store_true", help="树形渲染每个原子的事件序列")
     # --all 只影响 --tree：默认隐藏 system 心跳类事件，便于先看业务谱线
     p_task.add_argument("--all", action="store_true", help="树形渲染时显示全部事件（含 system）")
@@ -63,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--observe", action="store_true", help="观测模式：已知 CLI 激发结构化事件流，写原子事件 sidecar")
     p_run.add_argument("--task-id", default=None, help="任务 ID：把多次调用绑定为化合物（配合 task 子命令检索）")
     p_run.add_argument("--stdin-devnull", action="store_true", help="子进程 stdin 接 DEVNULL（无人值守防交互挂起）")
+    p_run.add_argument("--bond", default=None, metavar="ATOM-ID", help="显式化学键：声明输入来自哪个原子（默认时序链）")
 
     args = parser.parse_args(argv)
 
@@ -89,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                 observe=args.observe,
                 task_id=args.task_id,
                 stdin_devnull=args.stdin_devnull,
+                bond=args.bond,
             )
             print(f"exit={res.exit_code} duration={res.duration_ms}ms log={res.log_path}")
             if res.stdout_tail:
@@ -154,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
                         events = [event for event in events if event.get("kind") != "system"]
                     for line in render_atom_tree(events):
                         print(line)
+            return 0
+
+        if args.cmd == "serve":
+            serve(port=args.port, log_dir=args.dir)
             return 0
 
     except (OSError, ValueError, TypeError) as exc:

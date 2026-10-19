@@ -329,6 +329,63 @@ def test_element_color_table() -> None:
     assert element_color("no-such-element") == "#94a3b8"
 
 
+def test_bond_header_and_graph_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 显式化学键：--bond 声明输入来源 → header 落盘 → build_graph 跳线连接
+    from cli_gateway import events as ev
+
+    monkeypatch.setitem(ev.ELEMENTS, "python", {"format": "jsonl", "parser": "claude", "flags": []})
+    d = _tmp_logdir(tmp_path)
+    r0 = run([sys.executable, "-c", "print('root')"], log_dir=d, observe=True, task_id="T-bond")
+    id0 = Path(r0.log_path).stem
+    r1 = run([sys.executable, "-c", "print('mid')"], log_dir=d, observe=True, task_id="T-bond")
+    # 第三个原子显式键回连第一个（绕过中间）——同秒调用文件序随机，按 id 断言
+    r2 = run([sys.executable, "-c", "print('leaf')"], log_dir=d, observe=True, task_id="T-bond",
+             bond=id0)
+    atoms = task_atoms("T-bond", d)
+    assert len(atoms) == 3 and all(a["bond"] == "" or a["atom"] == Path(r2.log_path).stem for a in atoms)
+    g = ev.build_graph("T-bond", d)
+    id_by_idx = {i: n["id"] for i, n in enumerate(g["nodes"])}
+    leaf_idx = next(i for i, n in enumerate(g["nodes"]) if n["id"] == Path(r2.log_path).stem)
+    incoming = [l for l in g["links"] if l["target"] == leaf_idx]
+    assert len(incoming) == 1  # 显式键取代时序链，不叠加
+    src_id = id_by_idx[incoming[0]["source"]]
+    assert src_id == id0 and incoming[0].get("explicit") is True
+
+
+def test_serve_api_galaxy_and_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # serve：本机回环 + /api/galaxy + /api/graph + SPA 页面
+    import threading
+    import urllib.request
+
+    from cli_gateway import events as ev
+    from cli_gateway.serve import make_server
+
+    monkeypatch.setitem(ev.ELEMENTS, "python", {"format": "jsonl", "parser": "claude", "flags": []})
+    d = _tmp_logdir(tmp_path)
+    run([sys.executable, "-c", "print('srv')"], log_dir=d, observe=True, task_id="T-serve")
+    httpd = make_server(port=0, log_dir=d)  # 端口 0 = 系统分配，测试无冲突
+    port = httpd.server_address[1]
+    th = threading.Thread(target=httpd.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        page = urllib.request.getstart = urllib.request.urlopen(base + "/")
+        assert page.status == 200 and b"canvas" in page.read()
+        gal = json.loads(urllib.request.urlopen(base + "/api/galaxy").read())
+        assert any(t["task"] == "T-serve" for t in gal["tasks"])
+        g = json.loads(urllib.request.urlopen(base + "/api/graph?task=T-serve").read())
+        assert g["formula"] == "python×1" and g["nodes"][0]["n_events"] >= 3
+        try:
+            urllib.request.urlopen(base + "/api/graph")  # 缺 task → 400
+            raised = False
+        except urllib.error.HTTPError as e:
+            raised = e.code == 400
+        assert raised
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def _capture_task_json(d: str, task_id: str) -> list[str]:
     import io
     import contextlib
