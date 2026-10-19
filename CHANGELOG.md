@@ -2,6 +2,13 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本遵循语义化版本。
 
+## [1.6.1] - 2026-10-19
+
+### Fixed
+
+- **serve 页面黑屏**：`#scene` 画布为 static 定位被 `position:fixed` 的星野层完全覆盖——星野可见、分子不可见。补 `position:fixed; z-index:1` 后球棍模型正常显示（浏览器实测截图验证）
+- "返回星系"按钮与任务标题重叠 → 移至顶部居中
+
 ## [1.6.0] - 2026-10-19
 
 ### Added — 活分子宇宙（serve）与显式化学键

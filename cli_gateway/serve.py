@@ -81,10 +81,11 @@ PAGE = r"""<!DOCTYPE html>
 <style>
   html,body{margin:0;height:100%;background:#04060c;overflow:hidden;font-family:"Segoe UI",system-ui,sans-serif;color:#cbd5e1}
   #sky{position:fixed;inset:0}
+  #scene{position:fixed;inset:0;z-index:1}
   #hud{position:fixed;top:14px;left:18px;z-index:5;pointer-events:none}
   #hud h1{margin:0;font-size:18px;color:#e2e8f0;letter-spacing:.5px}
   #hud .meta{margin-top:4px;font-size:11px;color:#64748b}
-  #back{position:fixed;top:14px;left:18px;z-index:7;display:none;cursor:pointer;color:#38bdf8;font-size:13px}
+  #back{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:7;display:none;cursor:pointer;color:#38bdf8;font-size:13px}
   #tasklist{position:fixed;top:70px;left:18px;z-index:5;max-width:340px;max-height:70vh;overflow-y:auto}
   .tcard{cursor:pointer;margin:8px 0;padding:8px 12px;border:1px solid #1e293b;border-radius:10px;
          background:rgba(15,23,42,.55);font-size:12px}
