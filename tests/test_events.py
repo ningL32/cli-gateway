@@ -11,6 +11,7 @@ import json
 import sys
 import contextlib
 import io
+import time
 from pathlib import Path
 
 import pytest
@@ -338,7 +339,9 @@ def test_bond_header_and_graph_link(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     r0 = run([sys.executable, "-c", "print('root')"], log_dir=d, observe=True, task_id="T-bond")
     id0 = Path(r0.log_path).stem
     r1 = run([sys.executable, "-c", "print('mid')"], log_dir=d, observe=True, task_id="T-bond")
-    # 第三个原子显式键回连第一个（绕过中间）——同秒调用文件序随机，按 id 断言
+    # 第三个原子显式键回连第一个（绕过中间）。文件名时间戳为秒级（对外契约），
+    # POSIX 跑得快会同秒 → 排序随机；强制跨秒保证时序确定
+    time.sleep(1.05)
     r2 = run([sys.executable, "-c", "print('leaf')"], log_dir=d, observe=True, task_id="T-bond",
              bond=id0)
     atoms = task_atoms("T-bond", d)
