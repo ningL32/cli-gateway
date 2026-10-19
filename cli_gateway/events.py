@@ -24,8 +24,8 @@ SCHEMA_VERSION = 1
 # 元素周期表：已知能以结构化谱线发光的元素及其观测配方（flags 追加在 argv 末尾）。
 # 其余元素默认 text（连续谱）：照常执行，仅记录全文 answer 事件。
 ELEMENTS: dict[str, dict[str, Any]] = {
-    "claude": {"format": "jsonl", "parser": "claude", "flags": ["--output-format", "stream-json", "--verbose"]},
-    "codex": {"format": "jsonl", "parser": "codex", "flags": ["--json"]},
+    "claude": {"format": "jsonl", "parser": "claude", "color": "#f59e0b", "flags": ["--output-format", "stream-json", "--verbose"]},
+    "codex": {"format": "jsonl", "parser": "codex", "color": "#10b981", "flags": ["--json"]},
 }
 
 
@@ -293,6 +293,261 @@ def task_formula(atoms: list[dict[str, str]]) -> str:
     if not counts:
         return "(empty)"
     return " + ".join(f"{name}×{n}" for name, n in counts.most_common())
+
+
+# 元素色卡（球棍模型渲染用；agents/*.md frontmatter color 的同源配色，未知元素灰）
+ELEMENT_COLORS: dict[str, str] = {
+    "claude": "#f59e0b",
+    "codex": "#10b981",
+    "goose": "#ef4444",
+    "opencode": "#06b6d4",
+    "qoder": "#3b82f6",
+    "mcode": "#eab308",
+    "kilo": "#d97706",
+    "crush": "#ec4899",
+    "hermes": "#f472b6",
+}
+
+
+def element_color(name: str) -> str:
+    """元素色：周期表配方优先，色卡兜底，未知元素中性灰。"""
+    return str(ELEMENTS.get(name, {}).get("color") or ELEMENT_COLORS.get(name) or "#94a3b8")
+
+
+def _atom_preview(events: list[dict[str, Any]], cap: int = 40) -> list[dict[str, str]]:
+    """原子内事件的树视图摘要（system 心跳剔除，超长裁剪）——HTML 下钻面板用。"""
+    out: list[dict[str, str]] = []
+    for e in events:
+        kind = str(e.get("kind", "note"))
+        if kind == "system":
+            continue
+        payload = e.get("payload") or {}
+        if kind == "question":
+            argv = payload.get("argv") or []
+            summary = str(argv[-1])[:120] if argv else ""
+        elif kind in ("text", "reasoning", "answer"):
+            summary = str(payload.get("text", ""))[:160]
+        elif kind == "tool_call":
+            summary = f"{payload.get('name') or '?'} {str(payload.get('input', ''))[:120]}"
+        elif kind == "tool_result":
+            summary = str(payload.get("content", ""))[:120]
+        else:
+            summary = str(payload.get("message") or payload.get("result") or "")[:120]
+        out.append({"kind": kind, "summary": summary})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def build_graph(task_id: str, log_dir: str | Path | None = None) -> dict[str, Any]:
+    """分子数据面：task → 球棍模型 JSON（nodes/links/formula）。
+
+    nodes：原子（颜色=元素色卡、大小原料=duration、下钻预览=类型化事件摘要）；
+    links：task 内相邻原子的时序键（weight=上一个原子 answer 的字节数，数据流量）。
+    """
+    from datetime import datetime as _dt
+
+    atoms = task_atoms(task_id, log_dir)
+    nodes: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+    for i, a in enumerate(atoms):
+        node: dict[str, Any] = {
+            "id": a["atom"],
+            "element": a["element"],
+            "color": element_color(a["element"]),
+            "exit_code": a["exit_code"],
+            "state": a["state"],
+            "duration_ms": a["duration_ms"],
+            "n_events": 0,
+            "kinds": {},
+            "question": "",
+            "preview": [],
+        }
+        if a["events_path"]:
+            try:
+                evs = read_events(a["events_path"])
+            except (OSError, FileNotFoundError):
+                evs = []
+            node["n_events"] = len(evs)
+            kinds: Counter = Counter(e.get("kind", "?") for e in evs)
+            node["kinds"] = dict(kinds)
+            for e in evs:
+                if e.get("kind") == "question":
+                    argv = (e.get("payload") or {}).get("argv") or []
+                    node["question"] = str(argv[-1])[:160] if argv else ""
+                    break
+            node["preview"] = _atom_preview(evs)
+        if i > 0:
+            prev = atoms[i - 1]
+            weight = 0
+            if prev["events_path"]:
+                try:
+                    for e in read_events(prev["events_path"]):
+                        if e.get("kind") == "answer":
+                            weight = len((e.get("payload") or {}).get("text", "").encode("utf-8"))
+                            break
+                except (OSError, FileNotFoundError):
+                    pass
+            links.append({"source": i - 1, "target": i, "weight": weight})
+        nodes.append(node)
+    return {
+        "task": task_id,
+        "formula": task_formula(atoms),
+        "generated_at": _dt.now().isoformat(timespec="seconds"),
+        "nodes": nodes,
+        "links": links,
+    }
+
+
+def render_html(graph: dict[str, Any]) -> str:
+    """分子数据 → 自包含 HTML 球棍模型（零依赖 canvas 3D，暗色宇宙风）。
+
+    数据内嵌于页面；渲染器零外部请求，双击即开、离线可用、数据不出本机。
+    """
+    payload = json.dumps(graph, ensure_ascii=False).replace("</", "<\\/")
+    return _HTML_TEMPLATE.replace("__GRAPH__", payload)
+
+
+_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>cli-gateway · 分子球棍模型</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060c;overflow:hidden;font-family:"Segoe UI",system-ui,sans-serif;color:#cbd5e1}
+  #sky{position:fixed;inset:0}
+  #hud{position:fixed;top:14px;left:18px;z-index:5;pointer-events:none}
+  #hud h1{margin:0;font-size:17px;font-weight:600;color:#e2e8f0;letter-spacing:.5px}
+  #hud .formula{margin-top:6px;font-size:13px}
+  #hud .meta{margin-top:4px;font-size:11px;color:#64748b}
+  .chip{display:inline-block;padding:1px 9px;margin-right:6px;border-radius:999px;border:1px solid;color:#e2e8f0;font-size:12px}
+  #legend{position:fixed;bottom:14px;left:18px;z-index:5;font-size:11px;color:#64748b}
+  #legend b{display:inline-block;width:8px;height:8px;border-radius:50%;margin:0 4px 0 10px}
+  #hint{position:fixed;bottom:14px;right:18px;z-index:5;font-size:11px;color:#475569}
+  #panel{position:fixed;top:0;right:-380px;width:360px;height:100%;background:rgba(8,12,22,.92);backdrop-filter:blur(6px);
+         border-left:1px solid #1e293b;transition:right .25s;z-index:6;padding:18px;box-sizing:border-box;overflow-y:auto}
+  #panel.open{right:0}
+  #panel h3{margin:0 0 4px;color:#e2e8f0;font-size:15px}
+  #panel .sub{font-size:11px;color:#64748b;margin-bottom:10px}
+  .ev{margin:7px 0;font-size:12px;line-height:1.5;border-left:2px solid #334155;padding-left:8px}
+  .ev b{font-size:10px;letter-spacing:.5px;padding:0 5px;border-radius:3px;margin-right:6px}
+  #close{position:absolute;top:10px;right:12px;cursor:pointer;color:#64748b;font-size:18px}
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+<canvas id="scene"></canvas>
+<div id="hud"><h1 id="title"></h1><div class="formula" id="formula"></div><div class="meta" id="meta"></div></div>
+<div id="legend"></div>
+<div id="hint">拖拽旋转 · 滚轮缩放 · 点击原子下钻事件流</div>
+<div id="panel"><span id="close">✕</span><h3 id="p-title"></h3><div class="sub" id="p-sub"></div><div id="p-evs"></div></div>
+<script>
+const G = __GRAPH__;
+const KIND_COLOR = {question:"#94a3b8",text:"#38bdf8",tool_call:"#f59e0b",tool_result:"#a3e635",
+  reasoning:"#c084fc",result:"#34d399",error:"#f87171",answer:"#e2e8f0",exit:"#64748b",note:"#475569"};
+
+// 星野
+const sky = document.getElementById("sky"), sctx = sky.getContext("2d");
+function paintSky(){ sky.width=innerWidth; sky.height=innerHeight; sctx.fillStyle="#04060c";
+  sctx.fillRect(0,0,sky.width,sky.height);
+  for(let i=0;i<240;i++){ const x=Math.random()*sky.width, y=Math.random()*sky.height,
+    r=Math.random()*1.1+.2, a=Math.random()*.5+.1;
+    sctx.fillStyle="rgba(148,163,184,"+a+")"; sctx.beginPath(); sctx.arc(x,y,r,0,7); sctx.fill(); } }
+paintSky();
+
+// 球面斐波那契螺旋布点
+function spiral(n){ const pts=[], ga=Math.PI*(3-Math.sqrt(5));
+  for(let i=0;i<n;i++){ const y=1-2*(i+.5)/Math.max(n,1), r=Math.sqrt(Math.max(0,1-y*y)), th=ga*i;
+    pts.push([Math.cos(th)*r, y, Math.sin(th)*r]); } return pts; }
+
+const nodes = G.nodes.map((n,i)=>({...n, base:[0,0,0]}));
+const pts = spiral(nodes.length);
+nodes.forEach((n,i)=>{ n.base=pts[i]; });
+const R = Math.min(innerWidth,innerHeight)*0.33;
+let rotY=0.6, tiltX=-0.25, zoom=1.0, spin=0.0025, dragging=false, lx=0, ly=0, selected=-1;
+
+const cv = document.getElementById("scene"), ctx = cv.getContext("2d");
+function resize(){ cv.width=innerWidth; cv.height=innerHeight; } resize();
+addEventListener("resize", ()=>{ paintSky(); resize(); });
+
+function project(p){ // 绕 Y 旋转 → 绕 X 倾斜 → 透视
+  const [x,y,z]=p, cy=Math.cos(rotY), sy=Math.sin(rotY);
+  let x1=x*cy+z*sy, z1=-x*sy+z*cy;
+  const cx=Math.cos(tiltX), sx=Math.sin(tiltX);
+  let y1=y*cx - z1*sx, z2=y*sx + z1*cx;
+  const d=3.2, f=1/(1+z2/d);
+  return {x:innerWidth/2 + x1*R*zoom*f, y:innerHeight/2 + y1*R*zoom*f, z:z2, f};
+}
+function ring(ctx2,x,y,r,color,dashed){ ctx2.strokeStyle=color; ctx2.lineWidth=1.4;
+  if(dashed) ctx2.setLineDash([4,4]); ctx2.beginPath(); ctx2.arc(x,y,r,0,7); ctx2.stroke(); ctx2.setLineDash([]); }
+
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(!dragging) rotY+=spin;
+  const proj = nodes.map(n=>({...project(n.base), n}));
+  // 键（时序链，粗细=数据流量）
+  for(const l of G.links){ const a=proj[l.source], b=proj[l.target]; if(!a||!b) continue;
+    ctx.strokeStyle="rgba(100,116,139,"+(0.12+Math.min(0.45,(l.weight||200)/8000))+")";
+    ctx.lineWidth=0.8+Math.min(3.2,(l.weight||200)/2500);
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
+  // 球（远→近）
+  proj.sort((a,b)=>b.z-a.z).forEach(p=>{ const n=p.n, r=(8+Math.min(26,(n.duration_ms||1000)/4000))*p.f;
+    p.sr=r;
+    const g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,r*2.6);
+    g.addColorStop(0,n.color+"cc"); g.addColorStop(.45,n.color+"44"); g.addColorStop(1,n.color+"00");
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(p.x,p.y,r*2.6,0,7); ctx.fill();
+    ctx.fillStyle=n.color; ctx.beginPath(); ctx.arc(p.x,p.y,r*.62,0,7); ctx.fill();
+    if(n.state==="timed_out") ring(ctx,p.x,p.y,r,dashed="#f59e0b",true);
+    else if((n.exit_code||0)!==0 && n.state!=="not_found") ring(ctx,p.x,p.y,r,"#f87171",false);
+    else if(n.state==="completed") ring(ctx,p.x,p.y,r*1.15,"rgba(226,232,240,.35)",false);
+    ctx.fillStyle="rgba(226,232,240,.85)"; ctx.font=(10*p.f).toFixed(1)+"px system-ui"; ctx.textAlign="center";
+    ctx.fillText(n.element, p.x, p.y - r*1.5);
+    if(p.f>1.02){ ctx.fillStyle="rgba(148,163,184,.7)"; ctx.font=(9*p.f).toFixed(1)+"px system-ui";
+      ctx.fillText((n.question||"").slice(0,28), p.x, p.y + r*1.9); }
+  });
+  cv._proj = proj;
+  requestAnimationFrame(draw);
+}
+
+// HUD 与图例
+document.getElementById("title").textContent = "task · " + G.task;
+document.getElementById("formula").innerHTML = G.formula.split(" + ").map(s=>{
+  const [el,c]=s.split("×"); const color=(G.nodes.find(n=>n.element===el)||{}).color||"#94a3b8";
+  return '<span class="chip" style="border-color:'+color+'55;background:'+color+'14">'+el+' ×'+c+'</span>'; }).join("");
+document.getElementById("meta").textContent = G.nodes.length+" atoms · generated "+G.generated_at;
+const els=[...new Set(G.nodes.map(n=>n.element))];
+document.getElementById("legend").innerHTML = "元素色卡："+els.map(e=>{
+  const c=(G.nodes.find(n=>n.element===e)||{}).color||"#94a3b8";
+  return "<b style='background:"+c+"'></b>"+e; }).join("");
+
+// 交互
+cv.addEventListener("mousedown",e=>{dragging=true;lx=e.clientX;ly=e.clientY});
+addEventListener("mouseup",()=>dragging=false);
+addEventListener("mousemove",e=>{ if(!dragging) return;
+  rotY+=(e.clientX-lx)*0.006; tiltX=Math.max(-1.2,Math.min(1.2,tiltX+(e.clientY-ly)*0.004));
+  lx=e.clientX; ly=e.clientY; });
+cv.addEventListener("wheel",e=>{ zoom=Math.max(.5,Math.min(2.6,zoom*(e.deltaY<0?1.08:.93))); e.preventDefault(); },{passive:false});
+cv.addEventListener("click",e=>{ const proj=cv._proj||[]; let best=-1,bd=1e9;
+  proj.forEach((p,i)=>{ const d=Math.hypot(e.clientX-p.x,e.clientY-p.y);
+    if(d<Math.max(14,p.sr||12)+8 && d<bd){bd=d;best=i;} });
+  if(best>=0){ selected=best; openPanel(nodes[best]); } });
+function openPanel(n){
+  document.getElementById("panel").classList.add("open");
+  document.getElementById("p-title").textContent = n.element+" · "+n.id;
+  document.getElementById("p-sub").textContent =
+    "exit="+n.exit_code+"  state="+n.state+"  "+n.duration_ms+"ms  events="+n.n_events;
+  document.getElementById("p-evs").innerHTML = (n.preview||[]).map(ev=>{
+    const c=KIND_COLOR[ev.kind]||"#475569";
+    return '<div class="ev" style="border-color:'+c+'66"><b style="color:'+c+';border:1px solid '+c+'55">'+ev.kind+
+           '</b>'+ (ev.summary||"").replace(/&/g,"&amp;").replace(/</g,"&lt;") +'</div>'; }).join("")
+    || '<div class="ev">（无事件预览——sidecar 缺失或未观测）</div>';
+}
+document.getElementById("close").onclick=()=>document.getElementById("panel").classList.remove("open");
+draw();
+</script>
+</body>
+</html>
+"""
 
 
 def task_atoms(task_id: str, log_dir: str | Path | None = None) -> list[dict[str, Any]]:

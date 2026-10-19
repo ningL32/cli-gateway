@@ -24,7 +24,7 @@ from . import (
     task_formula,
 )
 from .doctor import doctor
-from .events import render_atom_tree
+from .events import build_graph, render_atom_tree, render_html
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
     p_task.add_argument("task_id", help="任务 ID（run --task-id 绑定）")
     p_task.add_argument("--dir", default=None, help="日志目录")
     p_task.add_argument("--json", action="store_true", help="结构化 JSON 输出")
+    p_task.add_argument("--graph", action="store_true", help="分子数据 JSON（nodes/links/formula，球棍模型数据面）")
+    p_task.add_argument("--html", action="store_true", help="自包含 HTML 球棍模型（打印到 stdout，重定向到 .html 文件后双击打开）")
     p_task.add_argument("--tree", action="store_true", help="树形渲染每个原子的事件序列")
     # --all 只影响 --tree：默认隐藏 system 心跳类事件，便于先看业务谱线
     p_task.add_argument("--all", action="store_true", help="树形渲染时显示全部事件（含 system）")
@@ -122,6 +124,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"\n{ok_n}/{len(rows)} 可用；探测日志已落盘 {DEFAULT_LOG_DIR}")
             return 0 if all(r["ok"] for r in rows) else 1
         if args.cmd == "task":
+            if args.graph or args.html:
+                # 数据面/渲染面：输出到 stdout，由调用方重定向（零新增文件 IO）
+                graph = build_graph(args.task_id, args.dir)
+                if args.html:
+                    print(render_html(graph))
+                else:
+                    print(json.dumps(graph, ensure_ascii=False, indent=2))
+                return 0
             atoms = task_atoms(args.task_id, args.dir)
             if args.json:
                 print(json.dumps({"task": args.task_id, "formula": task_formula(atoms), "atoms": atoms}, ensure_ascii=False, indent=2))

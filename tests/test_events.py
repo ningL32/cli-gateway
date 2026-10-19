@@ -292,6 +292,43 @@ def test_render_neutralizes_newlines_and_clips_result() -> None:
     assert "boom-real" in lines[2]
 
 
+def test_build_graph_and_html(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 分子数据面：nodes/links/公式/色卡；渲染面：自包含 HTML 内嵌数据
+    from cli_gateway import events as ev
+
+    monkeypatch.setitem(ev.ELEMENTS, "python", {"format": "jsonl", "parser": "claude", "flags": []})
+    d = _tmp_logdir(tmp_path)
+    for i in range(2):
+        run([sys.executable, "-c", f"print('g{i}')"], log_dir=d, observe=True, task_id="T-graph")
+    g = ev.build_graph("T-graph", d)
+    assert g["formula"] == "python×2"
+    assert len(g["nodes"]) == 2 and len(g["links"]) == 1
+    assert g["nodes"][0]["color"] == "#94a3b8"  # 未知元素中性灰
+    assert g["links"][0]["source"] == 0 and g["links"][0]["target"] == 1
+    # 同秒两次调用的文件序由随机后缀决定——按集合断言，不假设先后
+    qs = {n["question"] for n in g["nodes"]}
+    assert qs == {"print('g0')", "print('g1')"}
+    assert any(k == "answer" for k in g["nodes"][0]["kinds"])
+    assert g["nodes"][0]["preview"] and g["nodes"][0]["preview"][0]["kind"] in ("question", "system", "text", "note", "answer")
+
+    html = ev.render_html(g)
+    assert html.startswith("<!DOCTYPE html>")
+    assert "const G = " in html and '"formula": "python×2"' in html
+    assert "</script>" in html
+    # 内嵌 JSON 块不得含未转义的闭合序列（提前终止 script 的风险）
+    import re
+
+    m = re.search(r"const G = (\{.*?\});\n", html, re.S)
+    assert m is not None and "</" not in m.group(1)
+
+
+def test_element_color_table() -> None:
+    from cli_gateway.events import element_color
+
+    assert element_color("claude") == "#f59e0b" and element_color("codex") == "#10b981"
+    assert element_color("no-such-element") == "#94a3b8"
+
+
 def _capture_task_json(d: str, task_id: str) -> list[str]:
     import io
     import contextlib

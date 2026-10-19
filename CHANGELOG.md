@@ -2,6 +2,18 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本遵循语义化版本。
 
+## [1.5.0] - 2026-10-19
+
+### Added — 球棍模型：任务的分子可视化
+
+- `cli-gateway task <id> --graph`：分子数据 JSON——nodes（原子：元素色卡/exit/state/duration/类型化事件预览）+ links（时序键，weight=answer 字节数）+ formula
+- `cli-gateway task <id> --html`：**自包含 HTML 球棍模型**（打印到 stdout，重定向保存后双击打开）——零依赖 canvas 3D：暗色星野、斐波那契螺旋球面布点、拖拽旋转/滚轮缩放、辉光渐变球（半径 ∝ duration）、元素色卡（claude 橙/codex 绿/goose 红/qoder 蓝/opencode 青/crush 品红/hermes 粉…）、timed_out 虚线裂解环、非零 exit 红环、点击原子下钻事件流面板；数据内嵌、离线可用、不出本机
+- `ELEMENTS` 周期表条目与色卡（`element_color()`）正式纳入 schema
+
+### Changed
+
+- 契约测试 63→65（分子数据结构、HTML 内嵌转义、色卡）
+
 ## [1.4.1] - 2026-10-19
 
 ### Added
