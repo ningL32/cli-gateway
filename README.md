@@ -99,6 +99,33 @@ cli-gateway doctor --only codex   # 只查指定命令
 
 形态判定以网关真实调用结果为准（先直调，Windows 下 not_found 自动再试 `cmd /c` 包装），不是静态猜测；全部可用退出码 0，否则 1——可直接接进 CI 或 agent 的启动自检。
 
+## 观测模式：原子 / 元素 / 化合物
+
+任务过程的物理化学模型（`--observe` + `--task-id`）：
+
+- **原子**：一次网关调用。问（argv/prompt）与答（输出）成对出现、天然不可分割；`exit_code` + `duration_ms` 是"结合完成"的证据。**守恒律**：原始日志是唯一真相，事件 sidecar（`<log>.events.jsonl`）是派生解读——解析失败降级为全文 answer 事件，绝不丢字。
+- **元素**：CLI 的种类。周期表（`ELEMENTS`）里的元素带一条**观测配方**——激发它以"离散谱线"（结构化 JSON 事件流）而非"连续谱"（纯文本）发光。同位素 = 版本/格式差异。
+- **化合物**：任务 = 化学键（上一个原子的输出成为下一个原子的输入）连接的原子图；**分子式** = 组成配比。
+
+```bash
+cli-gateway run --observe --task-id fix-login -- cmd //c claude -p "分析这个 diff"
+cli-gateway run --observe --task-id fix-login -- codex exec "修复它"
+cli-gateway task fix-login            # 原子清单 + 分子式（--json 机器可读）
+# task fix-login: 2 atoms | formula: claude×1 + codex×1
+```
+
+```python
+from cli_gateway import run, read_events, task_atoms, task_formula
+run(["claude", "-p", "分析"], observe=True, task_id="fix-login")
+events = read_events(log_path + ".events.jsonl")   # question → [note…] → answer → exit
+atoms = task_atoms("fix-login")                    # 化合物检索
+task_formula(atoms)                                # 'claude×1 + codex×1'
+```
+
+**谱线现状**：claude（`--output-format stream-json --verbose`）与 codex（`exec --json`）为 jsonl 离散谱——真机实测一次 claude 调用产生 37 事件（34 条 note 谱线：system/assistant/result + 全文 answer）；其余元素为 text 连续谱，照常执行并记录全文 answer。各 CLI 内部事件 schema 的深度解读（把 note 升级为类型化事件）留待后续版本——当前按行透传，原始字节始终以 raw 日志为准。
+
+**边界**：answer 事件含输出全文，适合中小输出（超大输出的流式事件化留待后续）；spawn 失败的调用不写 sidecar（raw 日志仍有完整记录）。
+
 ## 子智能体编队（agents/）
 
 [agents/](agents/) 内置 9 个编码 CLI 的 **ZCode 子代理操作员提示词**——上表 9 个 CLI 各配一个"专属操作员"：主会话（工头）负责拆解派工与验收，子代理通过 Bash 调用对应 CLI 真进程干活。方法论（C4/ADR/TDD/变异测试/八维审查等）全部内置在提示词里，开箱即用。

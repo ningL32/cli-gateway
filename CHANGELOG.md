@@ -2,6 +2,23 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本遵循语义化版本。
 
+## [1.2.0] - 2026-10-19
+
+### Added — 观测模式：原子 / 元素 / 化合物
+
+任务过程建模：原子 = 一次调用（问/答/exit 不可分）；元素 = CLI 种类（周期表 + 观测配方，激发结构化"离散谱线"）；化合物 = 任务（键连接的原子图，分子式 = 组成配比）。
+
+- `run()` 新增 `observe` / `task_id`；CLI 新增 `--observe` / `--task-id` 与 `task` 子命令（含 `--json`）
+- `events.py`：原子事件 schema（`question → [note…] → answer → exit`），JSONL sidecar `<log>.events.jsonl`；守恒律——raw 日志是唯一真相，解析失败降级为全文 answer
+- 元素周期表 `ELEMENTS`：claude（`--output-format stream-json --verbose`）、codex（`--json`）观测配方；未知元素 text 连续谱照常执行
+- `task_atoms()` / `task_formula()`：化合物检索与分子式；日志头部新增 `# task:` / `# element:` / `# observe:` 记录（仅观测模式写入）
+- 真机验证：claude 观测调用产生 37 事件（1 question + 34 note 谱线 [system/assistant/result] + 1 answer + 1 exit）
+- 库导出：`read_events` / `task_atoms` / `task_formula` / `ELEMENTS`
+
+### Changed
+
+- 契约测试 47→54（sidecar、配方表、化合物检索、CLI roundtrip）
+
 ## [1.1.1] - 2026-10-19
 
 三岗异构评审回炉（claude 八维 / qoder 边界交叉复核 / codex 并发攻坚，发现全部实测取证）。

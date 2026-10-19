@@ -13,7 +13,7 @@ import json
 import platform
 import sys
 
-from . import DEFAULT_LOG_DIR, list_logs, replay, run
+from . import DEFAULT_LOG_DIR, list_logs, replay, run, task_atoms, task_formula
 from .doctor import doctor
 
 
@@ -39,6 +39,14 @@ def main(argv: list[str] | None = None) -> int:
     p_doctor.add_argument("--no-probe", action="store_true", help="静态快查：只看 PATH 形态，不实跑版本探测")
     p_doctor.add_argument("--timeout", type=float, default=20.0, help="单命令探测超时秒数")
 
+    p_task = sub.add_parser("task", help="化合物检索：列出一个任务的全部原子（观测调用）")
+    p_task.add_argument("task_id", help="任务 ID（run --task-id 绑定）")
+    p_task.add_argument("--dir", default=None, help="日志目录")
+    p_task.add_argument("--json", action="store_true", help="结构化 JSON 输出")
+
+    p_run.add_argument("--observe", action="store_true", help="观测模式：已知 CLI 激发结构化事件流，写原子事件 sidecar")
+    p_run.add_argument("--task-id", default=None, help="任务 ID：把多次调用绑定为化合物（配合 task 子命令检索）")
+
     args = parser.parse_args(argv)
 
     # 打印子进程 tail 前兜底：裸 CP936 控制台编不出 UTF-8 字符时 replace，
@@ -57,7 +65,13 @@ def main(argv: list[str] | None = None) -> int:
             cmd = args.payload[1:] if args.payload[:1] == ["--"] else args.payload
             if not cmd:
                 parser.error("run 需要一个命令")
-            res = run(cmd, timeout=args.timeout, log_dir=args.dir)
+            res = run(
+                cmd,
+                timeout=args.timeout,
+                log_dir=args.dir,
+                observe=args.observe,
+                task_id=args.task_id,
+            )
             print(f"exit={res.exit_code} duration={res.duration_ms}ms log={res.log_path}")
             if res.stdout_tail:
                 print(res.stdout_tail, end="")
@@ -91,6 +105,21 @@ def main(argv: list[str] | None = None) -> int:
                 ok_n = sum(1 for r in rows if r["ok"])
                 print(f"\n{ok_n}/{len(rows)} 可用；探测日志已落盘 {DEFAULT_LOG_DIR}")
             return 0 if all(r["ok"] for r in rows) else 1
+        if args.cmd == "task":
+            atoms = task_atoms(args.task_id, args.dir)
+            if args.json:
+                print(json.dumps({"task": args.task_id, "formula": task_formula(atoms), "atoms": atoms}, ensure_ascii=False, indent=2))
+                return 0
+            if not atoms:
+                print(f"task {args.task_id}: 0 atoms（未找到；确认调用时带了 --task-id）")
+                return 1
+            print(f"task {args.task_id}: {len(atoms)} atoms | formula: {task_formula(atoms)}")
+            for a in atoms:
+                ev = " ✓events" if a["events_path"] else ""
+                print(f"  #{a['atom']}  {a['element']}  exit={a['exit_code']}  {a['state']}  {a['duration_ms']}ms{ev}")
+                print(f"      {a['log_path']}")
+            return 0
+
     except (OSError, ValueError, TypeError) as exc:
         # 库层抛出的参数/环境错误给单行提示，不甩裸 traceback
         print(f"cli-gateway: {exc}", file=sys.stderr)

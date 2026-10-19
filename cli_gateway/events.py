@@ -1,0 +1,197 @@
+"""cli-gateway events：观测模式的原子/元素/化合物模型。
+
+物理化学映射（设计的唯一依据，命名与语义在此定义）：
+- 原子：一次网关调用。问（argv/prompt）与答（输出）成对出现、不可分割——
+  exit_code/duration_ms 是"结合完成"的证据。原子记录永不修改原始日志。
+- 元素：CLI 的种类。每种元素有一条"观测配方"——激发它以离散谱线（结构化
+  JSON 事件流）而非连续谱（纯文本）发光。同位素 = 版本/格式差异（解析性不同）。
+- 化合物：一个任务 = 化学键（上一个原子的输出成为下一个原子的输入）连接的
+  原子图。分子式 = 组成配比（如 claude×3 + codex×2）。
+
+守恒律：原始日志是唯一真相，events sidecar（<log>.events.jsonl）是派生的
+结构化解读——解析失败永远降级为"全文 answer 事件"，绝不丢字。
+"""
+
+from __future__ import annotations
+
+import json
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+# 元素周期表：已知能以结构化谱线发光的元素及其观测配方（flags 追加在 argv 末尾）。
+# 其余元素默认 text（连续谱）：照常执行，仅记录全文 answer 事件。
+ELEMENTS: dict[str, dict[str, Any]] = {
+    "claude": {"format": "jsonl", "flags": ["--output-format", "stream-json", "--verbose"]},
+    "codex": {"format": "jsonl", "flags": ["--json"]},
+}
+
+
+def _element_name(argv: list[str]) -> str:
+    """从 argv 提取元素名：剥掉 cmd /c 包装（Windows npm shim），取首参文件名。"""
+    parts = list(argv)
+    if len(parts) >= 3 and parts[0].lower() == "cmd" and parts[1].lower() == "/c":
+        parts = parts[2:]
+    return Path(parts[0]).stem.lower() if parts else ""
+
+
+def observation_format(element: str) -> str:
+    """该元素的谱线类型：jsonl（离散谱）或 text（连续谱）。"""
+    return str(ELEMENTS.get(element, {}).get("format", "text"))
+
+
+def observation_flags(element: str) -> list[str]:
+    """该元素的观测配方；未知元素返回空（照原样执行）。"""
+    return list(ELEMENTS.get(element, {}).get("flags", []))
+
+
+def parse_stream(text: str) -> list[dict[str, Any]]:
+    """从输出文本提取结构化 note 事件：逐行尝试 JSON，失败行忽略。
+
+    保守策略（事实/推测分离）：各 CLI 内部事件 schema 未逐一实测，v1 不做
+    深度解读——能解析的行原样透传为 note.payload，解析不了的由调用方兜底为
+    全文 answer 事件。原始字节始终以 raw 日志为准。
+    """
+    notes: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, (dict, list, int, float, bool)) or obj is None:
+            notes.append({"kind": "note", "payload": {"raw": obj}})
+    return notes
+
+
+def build_events(
+    *,
+    atom: str,
+    task_id: str | None,
+    element: str,
+    ts: str,
+    argv: list[str],
+    output_text: str | None,
+    exit_code: int | None,
+    duration_ms: int,
+    state: str,
+) -> list[dict[str, Any]]:
+    """把一次调用组装成原子事件序列（question → [note…] → answer → exit）。"""
+    events: list[dict[str, Any]] = []
+
+    def emit(kind: str, payload: dict[str, Any]) -> None:
+        events.append(
+            {
+                "v": SCHEMA_VERSION,
+                "atom": atom,
+                "task": task_id,
+                "element": element,
+                "ts": ts,
+                "kind": kind,
+                "payload": payload,
+            }
+        )
+
+    emit("question", {"argv": argv})
+    if output_text is not None:
+        for note in parse_stream(output_text):
+            note["atom"], note["task"], note["element"], note["ts"] = atom, task_id, element, ts
+            events.append(note)
+        emit("answer", {"text": output_text})
+    emit("exit", {"exit_code": exit_code, "duration_ms": duration_ms, "state": state})
+    for i, e in enumerate(events):
+        e["seq"] = i
+    return events
+
+
+def write_events(sidecar: Path, events: list[dict[str, Any]]) -> None:
+    """原子事件写 sidecar（JSONL，一行一事件；UTF-8）。路径先 resolve 规范化。"""
+    target = Path(sidecar).resolve()
+    with open(target, "w", encoding="utf-8", newline="") as f:
+        for e in events:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def read_events(sidecar: str | Path) -> list[dict[str, Any]]:
+    """读取一次调用的原子事件序列。路径 resolve 规范化（消解 .. 段）。"""
+    p = Path(sidecar).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"events sidecar not found: {p}")
+    events: list[dict[str, Any]] = []
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # 半行/损坏行跳过，不拖垮整个序列
+    return events
+
+
+def task_formula(atoms: list[dict[str, str]]) -> str:
+    """分子式：任务内元素的组成配比（按原子数降序，如 "claude×3 + codex×2"）。"""
+    counts = Counter(a.get("element", "") for a in atoms if a.get("element"))
+    if not counts:
+        return "(empty)"
+    return " + ".join(f"{name}×{n}" for name, n in counts.most_common())
+
+
+def task_atoms(task_id: str, log_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    """化合物检索：扫描日志目录，返回属于该任务的原子（含事件摘要）。
+
+    判定依据是日志头部的 `# task:` 行（观测模式写入）。返回按文件名（时间序）
+    排列的原子摘要：atom / element / exit_code / state / duration_ms / events
+    sidecar 路径。
+    """
+    root = Path(log_dir) if log_dir else None
+    if root is None:
+        from . import DEFAULT_LOG_DIR
+
+        root = DEFAULT_LOG_DIR
+    if not root.is_dir():
+        return []
+    atoms: list[dict[str, Any]] = []
+    for log_path in sorted(root.glob("*.log")):
+        try:
+            # 头部（task/element 等元数据）与尾部（trailer 的结果字段）分段读，
+            # 避免大日志整读进内存
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                head = f.read(4096)
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 2048))
+                tail = f.read()
+        except OSError:
+            continue
+        task_line = next((l for l in head.splitlines() if l.startswith("# task: ")), None)
+        if task_line is None or task_line[len("# task: "):].strip() != task_id:
+            continue
+
+        def _field(prefix: str, section: str) -> str:
+            line = next((l for l in section.splitlines() if l.startswith(prefix)), "")
+            return line[len(prefix):].strip() if line else ""
+
+        element = _field("# element: ", head) or "unknown"
+        exit_code = _field("# exit_code: ", tail)
+        state = _field("# state: ", tail)
+        duration = _field("# duration_ms: ", tail)
+        sidecar = Path(str(log_path) + ".events.jsonl")
+        atoms.append(
+            {
+                "task": task_id,
+                "element": element,
+                "atom": log_path.stem,
+                "log_path": str(log_path),
+                "events_path": str(sidecar) if sidecar.is_file() else "",
+                "exit_code": int(exit_code) if exit_code.lstrip("-").isdigit() else None,
+                "state": state or "unknown",
+                "duration_ms": int(duration) if duration.isdigit() else None,
+            }
+        )
+    return atoms

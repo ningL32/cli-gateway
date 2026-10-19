@@ -28,7 +28,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
+
+from . import events as _events
 
 DEFAULT_LOG_DIR = Path(os.environ.get("CLI_GATEWAY_LOG_DIR", "~/.cli-gateway/logs")).expanduser()
 
@@ -407,6 +409,8 @@ def _run_once(
     tail: int,
     env: Mapping[str, str] | None,
     stdin_devnull: bool = False,
+    observe: bool = False,
+    task_id: str | None = None,
 ) -> GatewayResult:
     """单次尝试：spawn → 流式 tee → 终止/收尾 → 组装日志 → 结构化返回。"""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -423,6 +427,12 @@ def _run_once(
         merged_env.update(env)
     merged_env.setdefault("PYTHONUTF8", "1")
 
+    # 观测模式：查元素周期表。已知元素追加观测配方（激发离散谱线——结构化
+    # 事件流）；未知元素以连续谱（纯文本）照常执行，仍记录全文 answer 事件。
+    element = _events._element_name(argv)
+    observe_format = _events.observation_format(element) if observe else None
+    spawn_argv = list(argv) + (_events.observation_flags(element) if observe else [])
+
     popen_kwargs: dict = {}
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -431,7 +441,7 @@ def _run_once(
 
     try:
         proc = subprocess.Popen(
-            argv,
+            spawn_argv,
             cwd=str(cwd) if cwd else None,
             env=merged_env,
             stdin=subprocess.DEVNULL if stdin_devnull else None,
@@ -442,13 +452,13 @@ def _run_once(
     except FileNotFoundError as exc:
         # 启动前失败①：命令未找到（cwd 不存在已在守卫分流，不会到这里）
         return _spawn_failed_result(
-            log_path, argv, started_at, start, cwd, env, timeout, capture,
+            log_path, spawn_argv, started_at, start, cwd, env, timeout, capture,
             "not_found", _EXIT_NOT_FOUND, f"command not found: {exc}",
         )
     except OSError as exc:
         # 启动前失败②：找到但不可执行等（PermissionError / WinError 193 ...）
         return _spawn_failed_result(
-            log_path, argv, started_at, start, cwd, env, timeout, capture,
+            log_path, spawn_argv, started_at, start, cwd, env, timeout, capture,
             "spawn_error", _EXIT_SPAWN_ERROR, f"spawn failed: {exc}",
         )
 
@@ -521,7 +531,13 @@ def _run_once(
         for err in reader_errors[:2]:
             trailer.append(f"# warning: {err}")
 
-        header = _header_lines(argv, started_at, proc.pid, cwd, env, timeout, capture)
+        # header 记录实际执行的 argv（观测配方的 flags 透明可见）
+        header = _header_lines(spawn_argv, started_at, proc.pid, cwd, env, timeout, capture)
+        if task_id is not None:
+            header.append(f"# task: {task_id}")
+        if observe:
+            header.append(f"# element: {element}")
+            header.append(f"# observe: {observe_format}")
 
         # 组装日志：失败兜底最小日志，保证"有调用必有审计条目"
         assembly_error: OSError | None = None
@@ -550,7 +566,7 @@ def _run_once(
             truncated = True  # reader 异常出口/落盘通道残缺，输出可能不完整，显式告警
 
         result = GatewayResult(
-            command=shlex.join(argv),
+            command=shlex.join(spawn_argv),
             exit_code=exit_code,
             duration_ms=duration_ms,
             log_path=str(log_path),
@@ -565,6 +581,30 @@ def _run_once(
             timed_out=timed_out,
             env_overrides=_mask_env(env),
         )
+
+        # 观测模式：输出落盘后组装原子事件（question → [note…] → answer → exit）。
+        # 全文经 _tail_from_file 超大 tail 读取（复用存量 IO；适合中小输出，
+        # 超大输出的流式事件化留待后续版本）。
+        if observe:
+            merged_output: str | None = ""
+            if capture:
+                out_text, _ = _tail_from_file(stdout_part, 2**31 - 1)
+                err_text, _ = _tail_from_file(stderr_part, 2**31 - 1)
+                merged_output = "\n".join(t for t in (out_text, err_text) if t)
+            _events.write_events(
+                Path(str(log_path) + ".events.jsonl"),
+                _events.build_events(
+                    atom=log_path.stem,
+                    task_id=task_id,
+                    element=element,
+                    ts=started_at,
+                    argv=spawn_argv,
+                    output_text=merged_output,
+                    exit_code=exit_code,
+                    duration_ms=duration_ms,
+                    state=state,
+                ),
+            )
     finally:
         # 兜底：杀活进程、关管道、清 part——异常/半途退出也不泄漏资源
         try:
@@ -599,6 +639,8 @@ def run(
     env: Mapping[str, str] | None = None,
     retry_count: int = 0,
     stdin_devnull: bool = False,
+    observe: bool = False,
+    task_id: str | None = None,
 ) -> GatewayResult:
     """执行一条 CLI 命令，全量落盘并返回结构化结果。
 
@@ -610,6 +652,10 @@ def run(
     - retry_count 只对"启动前失败"（not_found / spawn_error）重试；
       超时/非零退出绝不自动重试；每次尝试独立日志
     - stdin_devnull=True 时子进程 stdin 接 DEVNULL（无人值守/探测场景防交互挂起）
+    - observe=True 开观测模式：已知元素（claude/codex）追加观测配方激发结构化
+      事件流，并把本次调用写成原子事件 sidecar（<log>.events.jsonl：
+      question/[note…]/answer/exit）；task_id 把多个原子绑定为一个任务（化合物），
+      供 task_atoms()/CLI `task` 子命令检索
     - 纯本地 subprocess，不发起任何网络请求
     """
     if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
@@ -633,6 +679,8 @@ def run(
             tail=tail,
             env=env,
             stdin_devnull=stdin_devnull,
+            observe=observe,
+            task_id=task_id,
         )
         if result.state not in _SPAWN_FAILURE_STATES or attempt == attempts - 1:
             break  # 只有启动前失败才重试
@@ -694,4 +742,22 @@ __all__ = [
     "replay",
     "list_logs",
     "DEFAULT_LOG_DIR",
+    "read_events",
+    "task_atoms",
+    "task_formula",
 ]
+
+
+def read_events(sidecar: str | os.PathLike) -> list[dict]:
+    """读取一次观测调用的原子事件序列（question/[note…]/answer/exit）。"""
+    return _events.read_events(sidecar)
+
+
+def task_atoms(task_id: str, log_dir: str | os.PathLike | None = None) -> list[dict]:
+    """化合物检索：返回属于 task_id 的原子摘要列表（按时间序）。"""
+    return _events.task_atoms(task_id, log_dir)
+
+
+def task_formula(atoms: list[dict]) -> str:
+    """分子式：任务内元素组成配比，如 "claude×3 + codex×2"。"""
+    return _events.task_formula(atoms)
