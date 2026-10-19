@@ -15,7 +15,8 @@
 ## 快速开始
 
 ```bash
-pip install -e .            # 或直接 PYTHONPATH=.
+pip install ai-cli-gateway   # PyPI 安装（PyPI 上 `cli-gateway` 名字已被占，故用此名）
+pip install -e .             # 或本仓开发安装（或直接 PYTHONPATH=.）
 
 # 作为库
 from cli_gateway import run, replay
