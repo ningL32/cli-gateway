@@ -65,16 +65,16 @@ codex CLI 失败/卡死（端点波动、上下文超限）：工头按本文件
 ## 调用方式
 
 ```
-cd <派单方指定的工作目录> && codex exec --full-auto "<任务描述>"
+cd <派单方指定的工作目录> && codex exec -s workspace-write "<任务描述>"
 ```
 
-- 任务描述写清：目标、验收标准、约束（不要自作主张扩大改动面）
+- 任务描述写清：目标、验收标准、约束（不要自作主张扩大改动面）；无人值守改文件用 `-s workspace-write`（实测 0.162 的 exec 子命令无 `--full-auto`）
 - 长任务 Bash timeout 给足 **600000ms**；启动前 `codex --version` 核对（版本与 provider 配置按你本机实际情况）
 
 ### 经 cli-gateway 留证调用
 
 ```bash
-cd <派单方指定的工作目录> && cli-gateway run --timeout 600 -- codex exec --full-auto "<任务描述>"
+cd <派单方指定的工作目录> && cli-gateway run --timeout 600 --stdin-devnull -- codex exec -s workspace-write "<任务描述>"
 ```
 
 - codex 官方安装自带原生 exe，网关 CreateProcess 直调无需包装（POSIX 直接写命令名）

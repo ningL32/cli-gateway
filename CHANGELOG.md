@@ -2,6 +2,19 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本遵循语义化版本。
 
+## [1.4.0] - 2026-10-19
+
+### Added — task --tree：对话树渲染
+
+- `cli-gateway task <id> --tree`：把任务内每个原子的类型化事件渲染成缩进树（原子头 element/exit/duration + 事件流）；`--all` 显示默认隐藏的 system 心跳
+- `render_atom_tree()`（events.py）：类型感知摘要（question 取 argv 末元素、text/reasoning 前 60 字符、tool_call 取 name+input、tool_result 前 40 字符、result 取结论或 usage；中文按字符截断）
+- CLI `run` 新增 `--stdin-devnull`（库参数此前已存在，补齐 CLI 面）
+- **编队实战回填**：本版本由 codex 在观测模式下实现（`--observe --task-id drill-tree`），演练收获 60 个真实 `command_execution → tool_call` 事件，**坐实**了 v1.3.0 的推测字段（name="shell"、input=完整命令）；claude 评审岗同观测链路参与
+
+### Fixed
+
+- codex 元素观测配方与 0.162 实测对齐：`exec` 子命令无 `--full-auto`，无人值守用 `-s workspace-write`（agents/codex.md 配方同步修正）
+
 ## [1.3.0] - 2026-10-19
 
 ### Added — 类型化谱线（对话树重建的第一步）

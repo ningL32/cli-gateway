@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import sys
+import contextlib
+import io
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,7 @@ from cli_gateway.events import (  # noqa: E402
     observation_flags,
     observation_format,
     parse_stream,
+    render_atom_tree,
 )
 
 
@@ -34,6 +37,15 @@ def _tmp_logdir(tmp_path: Path) -> str:
     d = tmp_path / "logs"
     d.mkdir()
     return str(d)
+
+
+def _capture_task_output(d: str, task_id: str, *flags: str) -> list[str]:
+    """捕获 task 子命令的人类可读输出，供树形渲染契约断言。"""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(["task", task_id, "--dir", d, *flags])
+    assert rc == 0
+    return buf.getvalue().splitlines()
 
 
 def test_element_table_recipes() -> None:
@@ -52,6 +64,27 @@ def test_parse_stream_jsonl_and_fallback() -> None:
     assert len(notes) == 2  # 两条合法 JSON 行；坏行忽略
     assert notes[0]["kind"] == "note"
     assert notes[0]["payload"]["raw"]["type"] == "tool_use"
+
+
+def test_render_atom_tree_indents_and_summarizes_events() -> None:
+    # 渲染层只消费事件字典：分支符由是否末条决定，长字段按契约截断
+    events = [
+        {"kind": "question", "payload": {"argv": ["claude", "修复测试"]}},
+        {"kind": "text", "payload": {"text": "字" * 61}},
+        {"kind": "tool_call", "payload": {"name": "Read", "input": {"f": "a.py"}}},
+        {"kind": "tool_result", "payload": {"content": "x" * 41}},
+        {"kind": "result", "payload": {"result": "ok", "usage": {"output_tokens": 1}}},
+        {"kind": "system", "payload": {"subtype": "init", "raw": {"type": "system"}}},
+        {"kind": "exit", "payload": {"exit_code": 0, "duration_ms": 12, "state": "completed"}},
+    ]
+    lines = render_atom_tree(events)
+    assert lines[0] == "  ├─ question: 修复测试"
+    assert lines[1] == "  ├─ text: " + "字" * 60
+    assert lines[2] == '  ├─ tool_call: Read {"f":"a.py"}'
+    assert lines[3] == "  ├─ tool_result: " + "x" * 40
+    assert lines[4] == "  ├─ result: ok"
+    assert lines[5] == "  ├─ system: init"
+    assert lines[-1] == "  └─ exit: exit_code=0 duration_ms=12 state=completed"
 
 
 # --- 类型化谱线（fixture 为 2026-10-19 真机采样，脱敏） ----------------------
@@ -197,6 +230,66 @@ def test_cli_run_observe_and_task_roundtrip(tmp_path: Path) -> None:
     assert out["formula"] == "python×1"
     assert len(out["atoms"]) == 1
     assert out["atoms"][0]["exit_code"] == 0
+
+
+def _run_typed_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_id: str) -> str:
+    """生成一个带 system/text/result 谱线的观测原子，作为 task --tree 输入。"""
+    monkeypatch.setitem(ELEMENTS, "python", {"format": "jsonl", "parser": "claude", "flags": []})
+    d = _tmp_logdir(tmp_path)
+    fixture = tmp_path / "fixture.jsonl"
+    fixture.write_text(
+        "\n".join(
+            [
+                '{"type":"system","subtype":"init"}',
+                '{"type":"assistant","message":{"content":[{"type":"text","text":"typed-ok"}]}}',
+                '{"type":"result","subtype":"success","result":"typed-ok"}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            "run", "--observe", "--task-id", task_id, "--dir", d, "--",
+            sys.executable, "-c", "import sys; print(open(sys.argv[1]).read(), end='')", str(fixture),
+        ]
+    )
+    assert rc == 0
+    return d
+
+
+def test_task_tree_hides_system_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    d = _run_typed_task(tmp_path, monkeypatch, "T-tree")
+    lines = _capture_task_output(d, "T-tree", "--tree")
+    # 原子头在前，事件树缩进在后；system 心跳默认不出现在树中
+    assert any("python" in line and "exit=0" in line and "completed" in line for line in lines)
+    assert any(line.startswith("  ├─ question: ") for line in lines)
+    assert any(line.startswith("  ├─ text: typed-ok") for line in lines)
+    assert any(line.startswith("  └─ exit: exit_code=0") for line in lines)
+    assert not any(line.startswith("  ├─ system:") or line.startswith("  └─ system:") for line in lines)
+
+
+def test_task_tree_all_displays_system_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    d = _run_typed_task(tmp_path, monkeypatch, "T-tree-all")
+    lines = _capture_task_output(d, "T-tree-all", "--tree", "--all")
+    assert "  ├─ system: init" in lines
+    assert any(line.startswith("  ├─ question: ") for line in lines)
+    assert any(line.startswith("  └─ exit: exit_code=0") for line in lines)
+
+
+def test_render_neutralizes_newlines_and_clips_result() -> None:
+    # 评审 P1 回归：换行不撑破树布局、result 截断、error 优先 message
+    from cli_gateway.events import render_atom_tree
+
+    events = [
+        {"kind": "text", "payload": {"text": "line1\nline2\nline3"}},
+        {"kind": "result", "payload": {"result": "x" * 200}},
+        {"kind": "error", "payload": {"message": "boom-real", "raw": {"type": "item.completed"}}},
+    ]
+    lines = render_atom_tree(events)
+    assert len(lines) == 3
+    assert all("\n" not in line for line in lines)
+    assert len(lines[1]) < 80
+    assert "boom-real" in lines[2]
 
 
 def _capture_task_json(d: str, task_id: str) -> list[str]:

@@ -185,6 +185,82 @@ def build_events(
     return events
 
 
+def _event_text(value: Any) -> str:
+    """把事件字段转成可渲染摘要；非字符串用紧凑 JSON，避免 Python 字典噪声。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _clip_event_text(value: Any, limit: int) -> str:
+    """摘要收口：清洗换行（`_one_line` 先例——树形布局每行恰一个事件）+ 按字符
+    数截断（中文一字一字符），避免长输出/多行文本撑破树视图。"""
+    cleaned = _event_text(value).replace("\r", " ").replace("\n", " ")
+    return cleaned[:limit]
+
+
+def _fallback_summary(event: dict[str, Any]) -> str:
+    """system/error/note 的摘要：error 类优先 message（真实报错信息——
+    codex 的 error 事件 raw.type 是外层 item.completed，按 type 优先会把
+    报错正文吞掉），其余优先 subtype，最后 raw 原生 type。"""
+    payload = event.get("payload") or {}
+    raw = payload.get("raw")
+    if payload.get("message") is not None:
+        return _event_text(payload["message"])
+    summary = payload.get("subtype") or (raw.get("type") if isinstance(raw, dict) else None)
+    if summary is not None:
+        return str(summary)
+    if raw is not None:
+        return _event_text(raw)
+    return "(empty)"
+
+
+def render_atom_tree(events: list[dict]) -> list[str]:
+    """把一次调用的原子事件序列渲染成缩进树（每行一个事件摘要）。
+
+    - 固定前缀为两个空格；除末行用 `└─`，其余用 `├─`
+    - question 取 argv 的最后一个元素；text/reasoning/answer 截取 text 前 60 字符
+    - tool_call 取 name + input 前 60 字符；tool_result 取 content 前 40 字符
+    - result 优先展示 result，否则展示 usage；system/error/note 展示类型摘要
+    """
+    lines: list[str] = []
+    for index, event in enumerate(events):
+        kind = str(event.get("kind", "unknown"))
+        payload = event.get("payload") or {}
+        if kind == "question":
+            argv = payload.get("argv") or []
+            summary = str(argv[-1]) if argv else "(empty)"
+        elif kind in ("text", "reasoning", "answer"):
+            summary = _clip_event_text(payload.get("text"), 60)
+        elif kind == "tool_call":
+            summary = _clip_event_text(
+                f"{payload.get('name') or 'unknown'} {_event_text(payload.get('input'))}", 60
+            )
+        elif kind == "tool_result":
+            summary = _clip_event_text(payload.get("content"), 40)
+        elif kind == "result":
+            # result 字段可能是全文答复：与其他摘要同一截断纪律（契约见 docstring）
+            summary = _clip_event_text(
+                payload.get("result")
+                if payload.get("result") is not None
+                else payload.get("usage"),
+                60,
+            )
+        elif kind == "exit":
+            summary = (
+                f"exit_code={payload.get('exit_code')} "
+                f"duration_ms={payload.get('duration_ms')} state={payload.get('state')}"
+            )
+        else:
+            # system/error/note 与未来新增类型都走宽容摘要，渲染层绝不抛异常
+            summary = _fallback_summary(event)
+        branch = "└─" if index == len(events) - 1 else "├─"
+        lines.append(f"  {branch} {kind}: {summary}")
+    return lines
+
+
 def write_events(sidecar: Path, events: list[dict[str, Any]]) -> None:
     """原子事件写 sidecar（JSONL，一行一事件；UTF-8）。路径先 resolve 规范化。"""
     target = Path(sidecar).resolve()
